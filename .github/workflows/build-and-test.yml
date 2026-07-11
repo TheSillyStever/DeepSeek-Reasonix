@@ -30,7 +30,8 @@ jobs:
 
       - name: Build Windows Executable
         shell: bash
-        run: go build -o reasonix.exe -v
+        # THE FIX: Pointing to the actual main package directory
+        run: go build -o reasonix.exe -v ./cmd/reasonix 
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
