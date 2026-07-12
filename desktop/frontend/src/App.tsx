@@ -92,6 +92,7 @@ import {
   type TokenMode,
   type ToolApprovalMode,
 } from "./lib/types";
+import type { InvocationMetadataMap, StructuredInvocationSubmit } from "./lib/invocationDisplay";
 import {
   composerProfileFromMeta,
   composerProfileFromTab,
@@ -1358,12 +1359,25 @@ export default function App() {
   }, []);
 
   const [pendingPlanRevisionsByTab, setPendingPlanRevisionsByTab] = useState<Record<string, string>>({});
+  const [invocationMetadataByTab, setInvocationMetadataByTab] = useState<Record<string, InvocationMetadataMap>>({});
   const pendingPlanRevisionSendingTabsRef = useRef(new Set<string>());
   const [footerHeight, setFooterHeight] = useState(0);
   const footerHeightRef = useRef(0);
   const footerRef = useRef<HTMLElement>(null);
   const activeTabIdRef = useRef(activeTabId);
-  const commitThenSendRef = useRef<(tabId: string, displayText: string, submitText?: string) => Promise<void>>(async () => {});
+  const commitThenSendRef = useRef<(tabId: string, displayText: string, submitText?: string, structured?: StructuredInvocationSubmit) => Promise<void>>(async () => {});
+  const handleInvocationMetadataChange = useCallback((metadata: InvocationMetadataMap) => {
+    const sourceTabId = activeTabIdRef.current;
+    if (!sourceTabId) return;
+    setInvocationMetadataByTab((current) => {
+      const previous = current[sourceTabId] ?? {};
+      const names = Object.keys(metadata);
+      if (names.length === Object.keys(previous).length && names.every((name) => (
+        previous[name]?.kind === metadata[name]?.kind && previous[name]?.color === metadata[name]?.color
+      ))) return current;
+      return { ...current, [sourceTabId]: metadata };
+    });
+  }, []);
   const rightDockDetailActive = rightDockMode !== "context" && workspacePreviewActive;
   const preferredWorkspacePanelWidth = rightDockDetailActive ? rightDockPreviewWidth : rightDockTreeWidth;
   const workspacePanelMinWidth = rightDockDetailActive ? RIGHT_DOCK_PREVIEW_MIN_WIDTH : RIGHT_DOCK_TREE_MIN_WIDTH;
@@ -1415,6 +1429,13 @@ export default function App() {
       ? planRevisionInsertRequest.request
       : null;
   const composerInsertRequest = activeTabId ? composerInsertRequestsByTab[activeTabId] ?? null : null;
+  const prefillSubagentCommand = useCallback((command: string) => {
+    if (!activeTabId) return;
+    setComposerInsertRequestsByTab((current) => ({
+      ...current,
+      [activeTabId]: { id: Date.now(), text: command, mode: "prefix" },
+    }));
+  }, [activeTabId]);
   const composerSessionKey = useMemo(() => {
     return composerDraftKeyForTab(activeTab, activeTabId);
   }, [activeTab, activeTabId]);
@@ -1586,16 +1607,17 @@ export default function App() {
     [activeTabId, patchActiveComposerProfile, syncModeToController],
   );
   const applyCollaborationMode = useCallback(
-    (m: CollaborationMode): Promise<void> => {
+    async (m: CollaborationMode): Promise<void> => {
       userPlanModeByTabRef.current = updateUserPlanModeIntent(userPlanModeByTabRef.current, activeTabId, m === "plan");
       if (m === "goal") {
         patchActiveComposerProfile({ collaborationMode: "normal", goalDraftMode: true, goal: "" }, ["collaborationMode", "goal"]);
         return setControllerCollaborationMode("normal");
       }
       patchActiveComposerProfile({ collaborationMode: m, goalDraftMode: false, goal: "" }, ["collaborationMode", "goal"]);
-      return setControllerCollaborationMode(m);
+      if (goal.trim()) await clearControllerGoal();
+      await setControllerCollaborationMode(m);
     },
-    [activeTabId, patchActiveComposerProfile, setControllerCollaborationMode],
+    [activeTabId, clearControllerGoal, goal, patchActiveComposerProfile, setControllerCollaborationMode],
   );
   const applyToolApprovalMode = useCallback(
     (m: ToolApprovalMode) => {
@@ -1826,7 +1848,7 @@ export default function App() {
   // (/skill, /hooks, /mcp) — goes straight to Submit, which the controller
   // resolves (a turn, or a listing Notice).
   const handleSend = useCallback(
-    async (displayText: string, submitText = displayText, requestedTabId = activeTabId) => {
+    async (displayText: string, submitText = displayText, requestedTabId = activeTabId, structured?: StructuredInvocationSubmit) => {
       const sourceTabId = requestedTabId || activeTabId;
       if (!sourceTabId) throw new Error(t("composer.workspaceStarting"));
       const trimmed = displayText.trim();
@@ -1922,7 +1944,7 @@ export default function App() {
       await setControllerCollaborationModeForTab(sourceTabId, controllerComposerProfileCollaborationMode(composerProfile));
       await setControllerToolApprovalModeForTab(sourceTabId, toolApprovalMode);
       if (goal.trim()) await setControllerGoalForTab(sourceTabId, goal);
-      await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim());
+      await commitThenSendRef.current(sourceTabId, trimmed, submitText.trim(), structured);
     },
     [activeTabId, applyGoal, closeTransientOverlays, collaborationMode, composerProfile, controllerReady, goal, notice, runShellForTab,
       setControllerCollaborationModeForTab, setControllerGoalForTab, setControllerToolApprovalModeForTab, switchModel, t, toolApprovalMode, showToast],
@@ -2492,7 +2514,7 @@ export default function App() {
   }, [state.items]);
 
   // send wrapper: commits any pending optimistic rewind before sending.
-  const commitThenSend = useCallback(async (sourceTabId: string, displayText: string, submitText?: string) => {
+  const commitThenSend = useCallback(async (sourceTabId: string, displayText: string, submitText?: string, structured?: StructuredInvocationSubmit) => {
     const sourceTab = tabMetas.find((tab) => tab.id === sourceTabId);
     if (!sourceTab) throw new Error(t("composer.workspaceStarting"));
     if (sourceTab.readOnly) throw new Error(t("composer.readOnlyChannel"));
@@ -2520,7 +2542,7 @@ export default function App() {
         setProjectRevision((v) => v + 1);
       }
     }
-    await sendToTab(sourceTabId, displayText, submitText);
+    await sendToTab(sourceTabId, displayText, submitText, undefined, structured);
   }, [rewindForTab, sendToTab, setRewindCommittingForTab, setRewindStateForTab, t, tabMetas]);
 
   const handleTranscriptPrompt = useCallback((text: string) => {
@@ -3692,6 +3714,7 @@ export default function App() {
                 olderHistoryCount={state.historyStartTurn}
                 loadingOlderHistory={state.historyOlderLoading}
                 onLoadOlderHistory={() => activeTabId && loadOlderHistory(activeTabId)}
+                invocationMetadata={activeTabId ? invocationMetadataByTab[activeTabId] : undefined}
               />
             )}
           </main>
@@ -3797,6 +3820,7 @@ export default function App() {
               tabId={activeTabId}
               effort={state.effort}
               onSend={handleSend}
+              onInvocationMetadataChange={handleInvocationMetadataChange}
               onSteer={handleSteer}
               onCancel={cancel}
               onCycleMode={cycleMode}
@@ -3988,6 +4012,7 @@ export default function App() {
             initialFocus={settingsFocus ?? undefined}
             agentRunning={state.running}
             desktopPlatform={desktopPlatform}
+            onUseSubagent={prefillSubagentCommand}
             onClose={() => {
               setSettingsFocus(null);
               setSettingsTarget(null);

@@ -874,7 +874,7 @@ func TestReadOnlyIndexBlockPointsAtReadOnlySkill(t *testing.T) {
 
 func TestSkillRoutingMetadataParsesButStaysOutOfIndex(t *testing.T) {
 	home := t.TempDir()
-	writeSkill(t, home, ".reasonix/skills/router.md", "---\ndescription: route me\ntriggers: code review, 检查代码\nnegative-triggers: explain only\nauto-use: prefer\nneeds-fresh-data: true\ncost: low\n---\nbody")
+	writeSkill(t, home, ".reasonix/skills/router.md", "---\ndescription: route me\ntriggers: code review, 检查代码\nnegative-triggers: explain only\nauto-use: prefer\nneeds-fresh-data: true\ncost: low\nrequires: mcp-server:github, mcp-tool:github/search_issues\nprofiles: delivery, balanced, economy, invalid\n---\nbody")
 	sk, ok := New(Options{HomeDir: home, DisableBuiltins: true}).Read("router")
 	if !ok {
 		t.Fatal("skill not loaded")
@@ -888,11 +888,79 @@ func TestSkillRoutingMetadataParsesButStaysOutOfIndex(t *testing.T) {
 	if sk.AutoUse != "prefer" || !sk.NeedsFreshData || sk.Cost != "low" {
 		t.Fatalf("routing metadata = auto:%q fresh:%v cost:%q", sk.AutoUse, sk.NeedsFreshData, sk.Cost)
 	}
+	if got := strings.Join(sk.Requires, ","); got != "mcp-server:github,mcp-tool:github/search_issues" {
+		t.Fatalf("Requires = %q", got)
+	}
+	if got := strings.Join(sk.Profiles, ","); got != "delivery,balanced,economy" {
+		t.Fatalf("Profiles = %q (invalid values should be dropped)", got)
+	}
+	if got := strings.Join(sk.InvalidProfiles, ","); got != "invalid" {
+		t.Fatalf("InvalidProfiles = %q (rejected values must be preserved for doctor)", got)
+	}
 	index := IndexBlock([]Skill{sk})
-	for _, forbidden := range []string{"code review", "auto-use", "needs-fresh-data"} {
+	for _, forbidden := range []string{"code review", "auto-use", "needs-fresh-data", "mcp-server:github", "profiles"} {
 		if strings.Contains(index, forbidden) {
 			t.Fatalf("routing metadata leaked into index (%q):\n%s", forbidden, index)
 		}
+	}
+}
+
+func TestColorFrontmatterParses(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, home, ".reasonix/skills/tagged.md", "---\ndescription: has a color\ncolor: amber\n---\nbody")
+	sk, ok := New(Options{HomeDir: home, DisableBuiltins: true}).Read("tagged")
+	if !ok {
+		t.Fatal("skill not loaded")
+	}
+	if sk.Color != "amber" {
+		t.Fatalf("Color = %q, want amber", sk.Color)
+	}
+}
+
+func TestInvocationDefaultsToAutoForExistingSkills(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, home, ".reasonix/skills/plain.md", "---\ndescription: no invocation field\n---\nbody")
+	sk, ok := New(Options{HomeDir: home, DisableBuiltins: true}).Read("plain")
+	if !ok {
+		t.Fatal("skill not loaded")
+	}
+	if sk.Invocation != "auto" {
+		t.Fatalf("Invocation = %q, want auto (default)", sk.Invocation)
+	}
+	if sk.Color != "" {
+		t.Fatalf("Color = %q, want empty for a file with no color: key", sk.Color)
+	}
+}
+
+func TestManualInvocationSkillExcludedFromIndex(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, home, ".reasonix/skills/private-agent.md", "---\ndescription: my private subagent\nrunAs: subagent\ninvocation: manual\n---\nbody")
+	writeSkill(t, home, ".reasonix/skills/public-agent.md", "---\ndescription: a discoverable subagent\nrunAs: subagent\n---\nbody")
+	store := New(Options{HomeDir: home, DisableBuiltins: true})
+	private, ok := store.Read("private-agent")
+	if !ok {
+		t.Fatal("private-agent not loaded")
+	}
+	if private.Invocation != "manual" {
+		t.Fatalf("Invocation = %q, want manual", private.Invocation)
+	}
+	public, ok := store.Read("public-agent")
+	if !ok {
+		t.Fatal("public-agent not loaded")
+	}
+
+	index := IndexBlock([]Skill{private, public})
+	if strings.Contains(index, "private-agent") {
+		t.Fatalf("manual-invocation skill leaked into index:\n%s", index)
+	}
+	if !strings.Contains(index, "public-agent") {
+		t.Fatalf("auto-invocation skill missing from index:\n%s", index)
+	}
+
+	// A read-only index built from only manual-invocation skills must render
+	// as empty, not a header wrapped around nothing.
+	if got := IndexBlock([]Skill{private}); got != "" {
+		t.Fatalf("IndexBlock of only manual-invocation skills = %q, want empty", got)
 	}
 }
 

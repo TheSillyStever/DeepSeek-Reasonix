@@ -92,6 +92,16 @@ export type Item =
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
 
+// Mid-turn steer messages are recorded as info notices carrying this prefix —
+// both live (the "steer" event below) and in replayed history (desktop/app.go
+// prefixes persisted steers the same way). The prefix is the only durable
+// marker, so display code identifies steers by it.
+export const STEER_NOTICE_PREFIX = "↪ ";
+
+export function isSteerNoticeText(text: string): boolean {
+  return text.startsWith(STEER_NOTICE_PREFIX);
+}
+
 interface State {
   items: Item[];
   running: boolean;
@@ -857,7 +867,7 @@ function applyEvent(s: State, e: WireEvent): State {
       return { ...s, running: s.turnActive ? s.running : false, seq: s.seq + 1, items };
     }
     case "steer":
-      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `s${s.seq}`, level: "info", text: `↪ ${e.text ?? ""}` }] };
+      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `s${s.seq}`, level: "info", text: `${STEER_NOTICE_PREFIX}${e.text ?? ""}` }] };
     case "approval_request": {
       if (s.cancelRequested) return s;
       return beginPromptWait({
@@ -1981,7 +1991,7 @@ export function useController() {
     replayPendingPromptsForActiveTab(activeTabId);
   }, [activeTabId]);
 
-  const sendToTab = useCallback(async (tabId: string, displayText: string, submitText = displayText, originalText?: string) => {
+  const sendToTab = useCallback(async (tabId: string, displayText: string, submitText = displayText, originalText?: string, structured?: import("./invocationDisplay").StructuredInvocationSubmit) => {
     if (!tabId) throw new Error(t("composer.workspaceStarting"));
     const seq = getOrCreateState(statesRef.current, tabId).seq;
     const display = displayText.trim();
@@ -1990,7 +2000,9 @@ export function useController() {
     dispatchTo(tabId, { type: "user", text: displayText, submitText: display !== submit ? submit : undefined, seq });
     invalidateCache();
     try {
-      const submitPromise = original
+      const submitPromise = structured
+        ? app.SubmitInvocationsToTab(tabId, structured.display.trim(), structured.input.trim(), structured.invocations)
+        : original
         ? app.SubmitEditedDisplayToTab(tabId, display, submit, original)
         : display !== submit ? app.SubmitDisplayToTab(tabId, display, submit) : app.SubmitToTab(tabId, submit);
       void submitPromise.catch((error) => {

@@ -472,7 +472,8 @@ export interface Meta {
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
-export type TokenMode = "full" | "economy";
+// "full" is the persisted compatibility value for the Balanced runtime profile.
+export type TokenMode = "full" | "economy" | "delivery";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
 
 export interface AutoResearchCompactView {
@@ -546,6 +547,7 @@ export function normalizeToolApprovalMode(
 
 export function normalizeTokenMode(mode?: string): TokenMode {
   if (mode === "economy") return "economy";
+  if (mode === "delivery") return "delivery";
   return "full";
 }
 
@@ -587,8 +589,10 @@ export interface CommandInfo {
   name: string; // without the leading slash
   description: string;
   hint?: string;
-  kind: "builtin" | "custom" | "mcp" | "skill";
+  kind: "builtin" | "custom" | "mcp" | "skill" | "subagent";
+  group?: "actions" | "management" | "subagents" | "skills" | "integrations";
   plugin?: string;
+  color?: string;
 }
 
 export interface DirEntry {
@@ -651,7 +655,7 @@ export interface GitCommitDetailView {
 export interface ComposerInsertRequest {
   id: number;
   text: string;
-  mode?: "insert" | "replace";
+  mode?: "insert" | "replace" | "prefix";
 }
 
 // MCP & Skills drawer (desktop/app.go Capabilities) — the GUI counterpart to
@@ -695,7 +699,15 @@ export interface SkillView {
   runAs: string;
   enabled: boolean;
   plugin?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  color?: string;
   invocation?: string;
+  invocationMode?: string;
+  body?: string;
+  configuredModel?: string;
+  configuredEffort?: string;
 }
 export interface SkillRootSkillView {
   name: string;
@@ -703,6 +715,10 @@ export interface SkillRootSkillView {
   scope: string;
   runAs: string;
   plugin?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  color?: string;
   invocation?: string;
 }
 export interface SkillRootView {
@@ -725,6 +741,16 @@ export interface CapabilitiesView {
 export interface SkillsSettingsView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
+}
+export interface SubagentProfileInput {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  color?: string;
+  model?: string;
+  effort?: string;
+  allowedTools?: string[];
+  scope?: "project" | "global";
 }
 export interface PluginView {
   name: string;
@@ -883,7 +909,7 @@ export interface MemoryView {
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "subagents" | "plugins" | "memory" | "hooks" | "diagnostics" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
 
 /** Capability diagnostics report from App.CapabilityDiagnostics (capdiag.Report). */
 export interface CapabilityDiagnosticsReport {
@@ -984,7 +1010,6 @@ export interface CapabilityIssue {
   remediation?: string;
   settings_tab?: string;
 }
-
 // Settings panel payloads (desktop/settings_app.go).
 export interface ProviderView {
   name: string;
