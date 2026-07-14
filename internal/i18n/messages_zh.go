@@ -51,7 +51,7 @@ var Chinese = Messages{
 	ChatStatusCancellingFmt:                "%s 正在停止… (%d 秒 · Ctrl+C 退出)",
 	ChatStatusIdle:                         "就绪",
 	ChatStatusYoloIdle:                     "已跳过工具批准",
-	ChatStatusCycleHint:                    "shift+tab 切换计划 · ctrl+y yolo",
+	ChatStatusCycleHint:                    "shift+tab 循环询问/自动/计划 · ctrl+y yolo",
 	ChatStatusCacheNowFmt:                  "本次命中 %s",
 	ChatStatusCacheAvgFmt:                  "平均 %s",
 	ChatStatusPlanApproval:                 "Enter/y 批准并执行 · n/Esc 继续规划 · PgUp/PgDn/Ctrl+Home/End 滚动",
@@ -220,6 +220,7 @@ var Chinese = Messages{
 	CmdResume:           "恢复已保存的会话",
 	CmdRename:           "重命名会话",
 	CmdModel:            "切换模型",
+	CmdStatus:           "显示会话状态",
 	CmdWorkMode:         "切换工作模式",
 	CmdMemory:           "查看记忆文件",
 	CmdMigrate:          "重试旧数据迁移",
@@ -333,17 +334,50 @@ var Chinese = Messages{
 	RewindApplyHint:           "↑/↓ · Enter 应用 · Esc 返回",
 	RewindEmpty:               "(空)",
 
-	SelectProvidersLabel:  "选择要启用的 provider",
-	EnterAPIKeysHeader:    "输入 API key（回车跳过、稍后再设）：",
-	MissingKeyIntro:       "reasonix.toml 已配置好 — 只差一个 API key 就可以开始。",
-	WroteFileFmt:          "已写入 %s",
-	SetupComplete:         "设置完成。",
-	SetupCancelled:        "设置已取消。",
-	TryHintFmt:            "试试: %s",
-	NextHint:              "下一步：设置 API key（运行 `reasonix setup` 或 export DEEPSEEK_API_KEY=...），然后运行 `reasonix run \"你的任务\"`。",
-	ConfirmReconfigureFmt: "%s 已存在。重新配置并覆盖？",
-	KeepingExisting:       "保留原配置不变。",
-	NotOverwritingFmt:     "%s 已存在，不覆盖",
+	SelectProvidersLabel:     "选择要启用的 provider",
+	EnterAPIKeysHeader:       "输入 API key（回车跳过、稍后再设）：",
+	MissingKeyIntro:          "reasonix.toml 已配置好 — 只差一个 API key 就可以开始。",
+	WroteFileFmt:             "已写入 %s",
+	SetupComplete:            "设置完成。",
+	SetupCancelled:           "设置已取消。",
+	TryHintFmt:               "试试: %s",
+	NextHint:                 "下一步：设置 API key（运行 `reasonix setup` 或 export DEEPSEEK_API_KEY=...），然后运行 `reasonix run \"你的任务\"`。",
+	ConfirmReconfigureFmt:    "%s 已存在。重新配置并覆盖？",
+	KeepingExisting:          "保留原配置不变。",
+	NotOverwritingFmt:        "%s 已存在，不覆盖",
+	SetupManagerTitle:        "供应商配置",
+	SetupAddOpenAI:           "添加 OpenAI 兼容供应商",
+	SetupAddAnthropic:        "添加 Anthropic 兼容供应商",
+	SetupProviderExistsFmt:   "供应商 %q 已存在。请进入现有供应商管理来编辑模型或设置。",
+	SetupSaveExit:            "保存并退出",
+	SetupSaveExitDesc:        "写入当前暂存的修改",
+	SetupCancel:              "取消",
+	SetupCancelDesc:          "放弃全部暂存修改",
+	SetupModelsUnit:          "个模型",
+	SetupKeySet:              "已设置 Key",
+	SetupKeyMissing:          "缺少 Key",
+	SetupDefaultBadge:        "默认",
+	SetupProviderActionsFmt:  "管理 %s",
+	SetupEditProvider:        "编辑供应商",
+	SetupUpdateKey:           "更新 API Key",
+	SetupTestRefresh:         "测试连接 / 刷新模型列表",
+	SetupSetDefault:          "设置默认模型",
+	SetupRemoveProvider:      "删除供应商",
+	SetupBack:                "返回",
+	SetupPromptModels:        "模型列表（用逗号分隔）",
+	SetupSharedKeyWarningFmt: "%s 已被 %s（%s）使用。确认共享这项凭据？",
+	SetupPromptAPIKeyFmt:     "输入 %s 的新值",
+	SetupSelectDefaultModel:  "选择默认模型",
+	SetupConfirmRemoveFmt:    "确认删除供应商 %s？",
+	SetupSummaryTitle:        "待保存修改：",
+	SetupSummaryAddedFmt:     "新增：%s",
+	SetupSummaryEditedFmt:    "编辑：%s",
+	SetupSummaryRemovedFmt:   "删除：%s",
+	SetupSummaryDefaultFmt:   "默认模型：%s",
+	SetupSummaryKeysFmt:      "更新 API Key：%d 项",
+	SetupSummaryNoChanges:    "没有修改",
+	SetupConfirmSave:         "保存这些修改？",
+	SetupConcurrentChangeFmt: "setup 打开期间配置已被修改（%s）。本次暂存修改未写入，请重新运行 setup 检查最新配置。",
 
 	// model fetching
 	FetchingModelsFmt:          "正在获取 %s 的模型列表...",
@@ -358,6 +392,8 @@ var Chinese = Messages{
 	SkipStaleCustomEntryFmt:    "跳过 reasonix.toml 里的旧 %q 条目（指向 %s）— 请手动从 [[providers]] 里删除",
 	APIKeyAlreadySetFmt:        "复用已设置的 %s",
 	APIKeyResetPromptFmt:       "重新输入 %s？",
+	InvalidAPIKeyEnvFmt:        "%q 不是有效的 API Key 变量名。只能使用字母、数字和下划线（例如 MY_PROVIDER_API_KEY）；这里不要填写模型名。",
+	RepairedAPIKeyEnvFmt:       "provider %s：已将无效的 API Key 变量名 %q 修复为 %q",
 
 	// custom provider
 	CustomProviderLabel:  "自定义模型",
@@ -367,7 +403,7 @@ var Chinese = Messages{
 	CustomMethodURL:      "从 URL 获取模型列表",
 	CustomPromptModel:    "请输入模型名称",
 	CustomPromptBaseURL:  "请输入 Base URL",
-	CustomPromptKeyEnv:   "请输入 API Key 环境变量名",
+	CustomPromptKeyEnv:   "API Key 变量名（直接回车使用默认值，不是模型名）",
 	CustomPromptAPIKey:   "请输入 API Key",
 	CustomAddedFmt:       "已添加自定义模型: %s",
 
@@ -379,7 +415,7 @@ var Chinese = Messages{
 	AnthropicMethodURL:             "从 URL 获取模型列表",
 	AnthropicPromptModel:           "请输入模型名称",
 	AnthropicPromptBaseURL:         "请输入 Base URL",
-	AnthropicPromptKeyEnv:          "请输入 API Key 环境变量名",
+	AnthropicPromptKeyEnv:          "API Key 变量名（直接回车使用默认值，不是模型名）",
 	AnthropicPromptAPIKey:          "请输入 API Key",
 	AnthropicAddedFmt:              "已添加 Anthropic 兼容模型: %s",
 	AnthropicFetchingModelsFmt:     "正在获取 %s 的模型列表...",
@@ -388,7 +424,7 @@ var Chinese = Messages{
 	AnthropicSelectModelsLabel:     "选择要启用的 %s 模型",
 
 	UnknownCommandFmt:         "未知命令 %q",
-	UsageRunHint:              "用法：reasonix run [--model NAME] <task>",
+	UsageRunHint:              "用法：reasonix -p [--model NAME] <task>",
 	ErrorPrefix:               "错误：",
 	ReconfigureOnUnknownModel: "配置的模型已不可用 —— 重新运行引导配置。",
 	WriteConfigErr:            "写入配置失败：",
@@ -440,8 +476,9 @@ var Chinese = Messages{
 	UsageBody: `reasonix — 由配置和插件驱动的 coding agent（多模型）
 
 用法：
-  reasonix [--model NAME] [-c|--continue] [--resume] [--copy] [--yolo] [--dir PATH]   交互式会话（多轮；-c 恢复最近一次，--resume 选择一个，--copy 在副本中继续）
-  reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] <task>   执行单次任务后退出
+  reasonix [--model NAME] [-c|--continue] [-r|--resume [QUERY]] [--permission-mode MODE] [--effort LEVEL] [--add-dir PATH]   交互式会话
+  reasonix -p|--print [--model NAME] [--output-format text|json|stream-json] [--allowed-tools RULES] [--add-dir PATH] <task>
+  reasonix run [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] [--output-format FORMAT] <task>
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 代码审查（基于本地 diff）
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  通过 HTTP+SSE 提供服务（支持可选认证）
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
@@ -462,8 +499,10 @@ var Chinese = Messages{
 示例：
   reasonix
   reasonix --continue
+  reasonix --resume provider-config
   reasonix run "把 main.go 里的 TODO 实现掉"
   reasonix run --model mimo-pro "给这个函数补单元测试"
+  reasonix -p "总结这个仓库" --output-format json
   reasonix subagent run review "审查当前改动"
   echo "解释这段代码" | reasonix run
 

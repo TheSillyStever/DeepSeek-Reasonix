@@ -549,10 +549,31 @@ func TestToolCallMutatesForDeliveryProfile(t *testing.T) {
 		{name: "security_review meta", toolName: "security_review", args: `{"task":"security"}`},
 		{name: "use_capability meta", toolName: "use_capability", args: `{"action":"inspect","capability_id":"mcp-server:github"}`},
 		{name: "test command", toolName: "bash", args: `{"command":"go test ./..."}`},
+		{name: "node syntax check", toolName: "bash", args: `{"command":"node --check app.js"}`},
+		{name: "node syntax check pipeline", toolName: "bash", args: `{"command":"tail -n +2 app.html | head -n 20 | node --check"}`},
+		{name: "node eval stays opaque", toolName: "bash", args: `{"command":"node -e 'console.log(1)'"}`, want: true},
+		{name: "node conditions flag stays opaque", toolName: "bash", args: `{"command":"node -C production server.js"}`, want: true},
+		{name: "node test runner", toolName: "bash", args: `{"command":"node --test"}`},
+		{name: "node test snapshot update stays opaque", toolName: "bash", args: `{"command":"node --test --test-update-snapshots"}`, want: true},
+		{name: "node test reporter file stays opaque", toolName: "bash", args: `{"command":"node --test --test-reporter=junit --test-reporter-destination=result.txt"}`, want: true},
+		{name: "node test rerun state stays opaque", toolName: "bash", args: `{"command":"node --test --test-rerun-failures=state.json"}`, want: true},
+		{name: "node test cpu profile stays opaque", toolName: "bash", args: `{"command":"node --test --cpu-prof"}`, want: true},
 		{name: "diff review", toolName: "bash", args: `{"command":"git diff --check"}`},
 		{name: "formatter write", toolName: "bash", args: `{"command":"gofmt -w internal/a.go"}`, want: true},
 		{name: "file redirect", toolName: "bash", args: `{"command":"printf x > generated.txt"}`, want: true},
 		{name: "compound verification", toolName: "bash", args: `{"command":"go test ./... 2>&1 | tail -20"}`},
+		{name: "pytest snapshot update stays opaque", toolName: "bash", args: `{"command":"pytest --snapshot-update"}`, want: true},
+		{name: "pytest junitxml report stays opaque", toolName: "bash", args: `{"command":"pytest --junitxml=report.xml"}`, want: true},
+		{name: "gotestsum junitfile stays opaque", toolName: "bash", args: `{"command":"gotestsum --junitfile out.xml ./..."}`, want: true},
+		{name: "go test coverprofile stays opaque", toolName: "bash", args: `{"command":"go test -coverprofile=cover.out ./..."}`, want: true},
+		{name: "go test blockprofile stays opaque", toolName: "bash", args: `{"command":"go test -blockprofile=block.out ./..."}`, want: true},
+		{name: "go test trace stays opaque", toolName: "bash", args: `{"command":"go test -trace trace.out ./..."}`, want: true},
+		{name: "go test compile binary stays opaque", toolName: "bash", args: `{"command":"go test -c ./internal/evidence"}`, want: true},
+		{name: "go test dotted cpuprofile stays opaque", toolName: "bash", args: `{"command":"go test ./internal/evidence -test.cpuprofile=cpu.out -count=1"}`, want: true},
+		{name: "go test artifacts stays opaque", toolName: "bash", args: `{"command":"go test -artifacts ./..."}`, want: true},
+		{name: "jest output file stays opaque", toolName: "bash", args: `{"command":"npm test -- --json --outputFile=result.json"}`, want: true},
+		{name: "mypy report stays opaque", toolName: "bash", args: `{"command":"mypy --txt-report reports src/"}`, want: true},
+		{name: "plain pytest", toolName: "bash", args: `{"command":"pytest"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -560,6 +581,61 @@ func TestToolCallMutatesForDeliveryProfile(t *testing.T) {
 				t.Fatalf("ToolCallMutates(%q, %s) = %v, want %v", tt.toolName, tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunnerWriteOutputFlagsCannotMasqueradeAsVerification(t *testing.T) {
+	// Snapshot flags rewrite checked-in fixtures and report/profile flags
+	// write explicit output paths; both must stay opaque mutations so the
+	// files they produce still require review and sign-off.
+	for _, command := range []string{
+		"pytest --snapshot-update",
+		"pytest --junitxml=report.xml",
+		"mypy --junit-xml report.xml src/",
+		"gotestsum --junitfile out.xml ./...",
+		"go test -coverprofile=cover.out ./...",
+		"go test --coverprofile cover.out ./...",
+		"go test -blockprofile=block.out ./...",
+		"go test -mutexprofile mutex.out ./...",
+		"go test -trace trace.out ./...",
+		"go test -c ./internal/evidence",
+		"go test -o evidence.test -c ./internal/evidence",
+		"go test ./internal/evidence -test.cpuprofile=cpu.out -count=1",
+		"go test -test.trace trace.out ./...",
+		"go test -artifacts ./...",
+		"go test ./... -args -test.testlogfile=log.txt",
+		"go test -test.gocoverdir=covdir ./...",
+		"gotestsum -- -test.coverprofile=cover.out ./...",
+		"npm test -- --updateSnapshot",
+		"npm test -- --json --outputFile=result.json",
+		"yarn test --outputFile.json=result.json",
+		"pytest --report-log=log.jsonl",
+		"mypy --txt-report reports src/",
+		"mypy --html-report html src/",
+		"mypy --xml-report=reports src/",
+		"mypy --cobertura-xml-report reports src/",
+	} {
+		if bashCommandIsVerification(command) {
+			t.Fatalf("%q writes files and must not be classified as verification", command)
+		}
+		if !ToolCallMutates("bash", json.RawMessage(`{"command":"`+command+`"}`), false) {
+			t.Fatalf("%q must remain an opaque mutation", command)
+		}
+	}
+	for _, command := range []string{
+		"pytest",
+		"gotestsum ./...",
+		"go test -cover ./...",
+		"go test -count=1 ./...",
+		"go test -test.v -test.run TestFoo ./...",
+		"pytest --trace",
+		"npm test -- --json",
+		"mypy src/",
+		"mypy --strict src/",
+	} {
+		if !bashCommandIsVerification(command) {
+			t.Fatalf("%q should remain a verification command", command)
+		}
 	}
 }
 
@@ -572,6 +648,130 @@ func TestToolCallRequiresDeliveryCriteriaForExecutionCommands(t *testing.T) {
 	}
 	if !ToolCallRequiresDeliveryCriteria("bash", json.RawMessage(`{"command":"git diff --check"}`), false) {
 		t.Fatal("git diff --check is a verification command and should require acceptance criteria")
+	}
+	if !ToolCallRequiresDeliveryCriteria("bash", json.RawMessage(`{"command":"node --check app.js"}`), false) {
+		t.Fatal("node --check is a verification command and should require acceptance criteria")
+	}
+}
+
+func TestLedgerDeliverySignoffAcceptsNodeSyntaxCheckAfterMutation(t *testing.T) {
+	ledger := NewLedger()
+	ledger.Record(ReceiptFromToolCall("edit_file", json.RawMessage(`{"path":"app.js"}`), true, false))
+	mutation, ok := ledger.LatestSuccessfulMutationIndex()
+	if !ok {
+		t.Fatal("expected mutation receipt")
+	}
+	ledger.Record(ReceiptFromToolCall("read_file", json.RawMessage(`{"path":"app.js"}`), true, true))
+	command := "node --check app.js"
+	ledger.Record(ReceiptFromToolCall("bash", json.RawMessage(`{"command":"node --check app.js"}`), true, false))
+	ledger.Record(ReceiptFromToolCall("complete_step", json.RawMessage(`{
+		"step":"Check JavaScript",
+		"result":"syntax valid",
+		"evidence":[{"kind":"verification","summary":"syntax valid","command":"node --check app.js"}]
+	}`), true, true))
+
+	if !IsDeliveryVerificationCommand(command) {
+		t.Fatal("node --check should be recognized as a delivery verification")
+	}
+	if latest, ok := ledger.LatestSuccessfulMutationIndex(); !ok || latest != mutation {
+		t.Fatalf("node --check moved latest mutation from %d to %d (ok=%v)", mutation, latest, ok)
+	}
+	if !ledger.HasSuccessfulReviewAfter(mutation) {
+		t.Fatal("expected post-mutation read to satisfy review")
+	}
+	if !ledger.HasSuccessfulDeliverySignoffAfter(mutation) {
+		t.Fatal("expected node --check to satisfy delivery sign-off")
+	}
+}
+
+func TestNodeEvalCannotMasqueradeAsDeliveryVerification(t *testing.T) {
+	command := `node -e 'require("fs").readFileSync("app.js")'`
+	if IsDeliveryVerificationCommand(command) {
+		t.Fatal("arbitrary node eval must not be recognized as delivery verification")
+	}
+	if !ToolCallMutates("bash", json.RawMessage(`{"command":"node -e 'require(\"fs\").readFileSync(\"app.js\")'"}`), false) {
+		t.Fatal("arbitrary node eval must remain an opaque mutation")
+	}
+}
+
+func TestNodeConditionsFlagCannotMasqueradeAsDeliveryVerification(t *testing.T) {
+	// Node CLI flags are case-sensitive: -C is --conditions and executes the
+	// target script, unlike the syntax-only -c/--check.
+	command := "node -C production server.js"
+	if IsDeliveryVerificationCommand(command) {
+		t.Fatal("node -C (--conditions) executes the script and must not be recognized as delivery verification")
+	}
+	if !ToolCallMutates("bash", json.RawMessage(`{"command":"node -C production server.js"}`), false) {
+		t.Fatal("node -C (--conditions) must remain an opaque mutation")
+	}
+}
+
+func TestNodeTestRunnerWriteFlagsCannotMasqueradeAsDeliveryVerification(t *testing.T) {
+	if !IsDeliveryVerificationCommand("node --test") {
+		t.Fatal("plain node --test should be recognized as a delivery verification")
+	}
+	// Test-runner state/report flags and Node runtime profiling/tracing flags
+	// create or update files. They must stay opaque mutations so those files
+	// still require review and sign-off.
+	for _, command := range []string{
+		"node --test --test-update-snapshots",
+		"node --test --test-reporter=junit --test-reporter-destination=result.txt",
+		"node --test --test-reporter junit --test-reporter-destination result.txt",
+		"node --test --test-rerun-failures=state.json",
+		"node --test --test-rerun-failures state.json",
+		"node --test --cpu-prof",
+		"node --test --heap-prof",
+		"node --test --heapsnapshot-near-heap-limit=1",
+		"node --test --heapsnapshot-signal=SIGUSR2",
+		"node --test --localstorage-file=localstorage.json",
+		"node --test --perf-basic-prof",
+		"node --test --perf-basic-prof-only-functions",
+		"node --test --perf-prof",
+		"node --test --prof",
+		"node --test --redirect-warnings=warnings.log",
+		"node --test --report-on-fatalerror",
+		"node --test --report-on-signal",
+		"node --test --report-uncaught-exception",
+		"node --test --tls-keylog=tls.log",
+		"node --test --trace-events-enabled",
+	} {
+		if IsDeliveryVerificationCommand(command) {
+			t.Fatalf("%q writes files and must not be recognized as delivery verification", command)
+		}
+	}
+}
+
+func TestLedgerReviewAfterRestoredCheckpointBaseline(t *testing.T) {
+	// A negative index is the restored-checkpoint baseline: the mutation
+	// happened before a controller rebuild or cold resume, so its receipt (and
+	// touched paths) are not in this ledger. Fresh review-shaped receipts must
+	// still be able to satisfy the review gate.
+	if NewLedger().HasSuccessfulReviewAfter(-1) {
+		t.Fatal("an empty ledger must not satisfy the checkpoint-baseline review")
+	}
+
+	read := NewLedger()
+	read.Record(ReceiptFromToolCall("read_file", json.RawMessage(`{"path":"internal/parser.go"}`), true, true))
+	if !read.HasSuccessfulReviewAfter(-1) {
+		t.Fatal("a successful read must satisfy review for a restored mutation baseline")
+	}
+
+	diff := NewLedger()
+	diff.Record(ReceiptFromToolCall("bash", json.RawMessage(`{"command":"git diff"}`), true, false))
+	if !diff.HasSuccessfulReviewAfter(-1) {
+		t.Fatal("a git diff inspection must satisfy review for a restored mutation baseline")
+	}
+
+	failed := NewLedger()
+	failed.Record(ReceiptFromToolCall("read_file", json.RawMessage(`{"path":"internal/parser.go"}`), false, true))
+	if failed.HasSuccessfulReviewAfter(-1) {
+		t.Fatal("a failed read must not satisfy the checkpoint-baseline review")
+	}
+
+	opaque := NewLedger()
+	opaque.Record(ReceiptFromToolCall("bash", json.RawMessage(`{"command":"echo done"}`), true, false))
+	if opaque.HasSuccessfulReviewAfter(-1) {
+		t.Fatal("a non-review command must not satisfy the checkpoint-baseline review")
 	}
 }
 

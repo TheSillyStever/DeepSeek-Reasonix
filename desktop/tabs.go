@@ -867,7 +867,7 @@ func (t *WorkspaceTab) recordPlannerDisplayEvent(e event.Event) {
 			if e.Level == event.LevelWarn {
 				level = "warn"
 			}
-			t.plannerDisplay = append(t.plannerDisplay, HistoryMessage{Role: "notice", Level: level, Content: e.Text, Detail: e.Detail})
+			t.plannerDisplay = append(t.plannerDisplay, HistoryMessage{Role: "notice", Level: level, Content: e.Text, Detail: e.Detail, Code: e.Code})
 		}
 	}
 }
@@ -1201,6 +1201,12 @@ func topicActivityStatusFromEvent(e event.Event) (string, bool) {
 	case event.ApprovalRequest, event.AskRequest:
 		return topicStatusWaitingConfirmation, true
 	case event.TurnDone:
+		if e.Outcome == event.TurnOutcomeFinalReadiness {
+			// The transcript presents this turn end as a recoverable delivery
+			// pause with a continue action, so the sidebar must not flag it
+			// as an error.
+			return topicStatusPaused, true
+		}
 		if e.Err != nil {
 			return topicStatusError, true
 		}
@@ -2956,7 +2962,6 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 	ctrl.EnableInteractiveApproval()
 	applyTabModeToController(ctrl, buildMode)
 	applyTabToolApprovalModeToController(ctrl, buildToolApprovalMode)
-	ctrl.SetGoal(buildGoal)
 
 	acquiredLeaseKey := ""
 	if dir := ctrl.SessionDir(); dir != "" {
@@ -3058,9 +3063,10 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 				return
 			}
 			if resumeSession != nil {
-				ctrl.Resume(sessionWithFreshSystemPrompt(resumeSession, systemPromptFrom(ctrl.History())), path)
+				resumeLoadedSessionAndGoal(ctrl, resumeSession, path, buildGoal)
 			} else {
 				ctrl.SetSessionPath(path)
+				ctrl.SetGoal(buildGoal)
 			}
 			a.persistTabSessionPath(tab, path)
 			a.mu.RLock()
@@ -3718,6 +3724,13 @@ func topicTitleUserTurnsFromSession(path string) []string {
 	}
 	var users []string
 	for _, msg := range msgs {
+		// Host-injected synthetic turns (readiness nudges, recovery retries) and
+		// mid-turn steers are persisted as role "user" but are not user-authored:
+		// counting them inflated userTurns past the stage-3 threshold and let
+		// "Host final-answer readiness check failed…" become a topic title.
+		if !agent.IsUserAuthoredTurn(msg.Text) {
+			continue
+		}
 		content := control.StripComposePrefixes(agent.HandoffTask(msg.Text))
 		content = control.StripReferencedContextPrefix(content)
 		if strings.TrimSpace(content) != "" {
@@ -5206,13 +5219,16 @@ func setTopicCreatedAt(workspaceRoot, topicID string, createdAt int64) error {
 	return saveTopicCreatedAts(workspaceRoot, created)
 }
 
-func deleteTopicCreatedAt(workspaceRoot, topicID string) {
+func deleteTopicCreatedAt(workspaceRoot, topicID string) error {
 	created, err := loadTopicCreatedAtsForUpdate(workspaceRoot)
 	if err != nil {
-		return
+		return err
+	}
+	if _, ok := created[topicID]; !ok {
+		return nil
 	}
 	delete(created, topicID)
-	_ = saveTopicCreatedAts(workspaceRoot, created)
+	return saveTopicCreatedAts(workspaceRoot, created)
 }
 
 // topicIndexMu serializes recovery writes to desktop-projects.json and topic
@@ -5336,7 +5352,7 @@ func activityStatusForTab(tab *WorkspaceTab) string {
 		return topicStatusWaitingConfirmation
 	}
 	if runtimeStatus.Running {
-		if status == "" || status == topicStatusError {
+		if status == "" || status == topicStatusError || status == topicStatusPaused {
 			return topicStatusThinking
 		}
 		return status
@@ -6306,55 +6322,68 @@ func (a *App) DeleteTopic(topicID string) error {
 }
 
 func (a *App) deleteTopic(topicID string) error {
+	// Deletion converges on the fully-deleted state instead of keying the
+	// whole cleanup on the title entry: a retry after a partial failure (or a
+	// concurrent duplicate delete) may find the title already gone while the
+	// sources map, created-at entry, sidebar index, or tombstone still need
+	// cleanup, so every step checks its own leftovers.
+	//
+	// Detailed cleanup is limited to roots that can actually hold the topic:
+	// roots whose sidebar index lists it, plus any root whose title map
+	// contains it. The title probe tolerates read errors on unindexed roots
+	// so unreadable metadata in an unrelated project cannot abort the
+	// deletion, while roots known to hold the topic still fail hard instead
+	// of being half-cleaned silently.
 	f := loadProjectsFile()
-	found := false
+	indexed := map[string]bool{
+		"": containsDesktopString(f.GlobalTopics, topicID) ||
+			containsDesktopString(f.GlobalPinnedTopics, topicID),
+	}
+	roots := make([]string, 0, len(f.Projects)+1)
 	for _, p := range f.Projects {
-		m, err := loadTopicTitlesForUpdate(p.Root)
+		roots = append(roots, p.Root)
+		indexed[p.Root] = containsDesktopString(p.Topics, topicID) ||
+			containsDesktopString(p.PinnedTopics, topicID)
+	}
+	roots = append(roots, "")
+	for _, root := range roots {
+		titles, err := loadTopicTitlesForUpdate(root)
+		if err != nil {
+			if indexed[root] {
+				return err
+			}
+			continue
+		}
+		_, hasTitle := titles[topicID]
+		if !hasTitle && !indexed[root] {
+			continue
+		}
+		// Fallible cleanup runs before the title entry is removed: for a
+		// title-map-only topic the title is the only locator that makes this
+		// root a candidate again, so it must survive a failed attempt and be
+		// deleted last.
+		sources, err := loadTopicTitleSourcesForUpdate(root)
 		if err != nil {
 			return err
 		}
-		if _, ok := m[topicID]; ok {
-			delete(m, topicID)
-			if err := saveTopicTitles(p.Root, m); err != nil {
-				return err
-			}
-			sources, err := loadTopicTitleSourcesForUpdate(p.Root)
-			if err != nil {
-				return err
-			}
+		if _, ok := sources[topicID]; ok {
 			delete(sources, topicID)
-			if err := saveTopicTitleSources(p.Root, sources); err != nil {
+			if err := saveTopicTitleSources(root, sources); err != nil {
 				return err
 			}
-			deleteTopicCreatedAt(p.Root, topicID)
-			found = true
-			break
 		}
-	}
-	if !found {
-		m, err := loadTopicTitlesForUpdate("")
-		if err != nil {
+		if err := deleteTopicCreatedAt(root, topicID); err != nil {
 			return err
 		}
-		if _, ok := m[topicID]; ok {
-			delete(m, topicID)
-			if err := saveTopicTitles("", m); err != nil {
-				return err
-			}
-			sources, err := loadTopicTitleSourcesForUpdate("")
-			if err != nil {
-				return err
-			}
-			delete(sources, topicID)
-			if err := saveTopicTitleSources("", sources); err != nil {
-				return err
-			}
-			deleteTopicCreatedAt("", topicID)
-			found = true
+		if err := deleteTopicAutoTitleMeta(root, topicID); err != nil {
+			return err
 		}
-	}
-	if !found {
-		return fmt.Errorf("topic %q not found", topicID)
+		if hasTitle {
+			delete(titles, topicID)
+			if err := saveTopicTitles(root, titles); err != nil {
+				return err
+			}
+		}
 	}
 	if err := removeTopicFromProjectsFile(topicID); err != nil {
 		return err

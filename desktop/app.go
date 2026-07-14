@@ -325,6 +325,19 @@ func (a *App) ensureMediaTokenStore() *mediaTokenStore {
 	return a.mediaTokens
 }
 
+// jsProfilingMiddleware opts every asset response into the JS Self-Profiling
+// document policy so the frontend performance monitor can attach sampled stacks
+// to long-task reports. Chromium WebViews (WebView2) honor it; WebKit ignores
+// both the header and the API, so the frontend degrades to unattributed reports.
+func (a *App) jsProfilingMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Document-Policy", "js-profiling")
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // workspaceMediaMiddleware returns an HTTP middleware that intercepts
 // /__reasonix_workspace_media/{token}/{filename} requests and serves the
 // corresponding workspace file. All other paths pass through to the Wails
@@ -900,8 +913,6 @@ func (a *App) submitToTab(tabID, input string, fromBridge bool) error {
 		if tab == nil {
 			return a.workspaceNotReadyErr(tab)
 		}
-		tab.turnStartMu.Lock()
-		defer tab.turnStartMu.Unlock()
 		if !fromBridge && a.botBridge != nil {
 			a.botBridge.reclaimFromDesktop(tab.ID)
 		}
@@ -1374,13 +1385,22 @@ func (a *App) SetMode(mode string) {
 	a.SetModeForTab("", mode)
 }
 
-func (a *App) SetModeForTab(tabID, mode string) {
+// SetModeForTab returns the pending approval prompt ids the switch
+// auto-allowed, so the frontend dismisses exactly those cards and keeps the
+// ones the backend still holds (plan/memory/sandbox-escape never drain, and
+// auto keeps approvals an allow policy would not cover — #6432).
+func (a *App) SetModeForTab(tabID, mode string) []string {
+	tab := a.tabByID(tabID)
+	if tab == nil {
+		return nil
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	normalized := normalizeTabMode(mode)
 	a.mu.Lock()
-	tab := a.tabByIDLocked(tabID)
-	if tab == nil {
+	if a.tabs[tab.ID] != tab {
 		a.mu.Unlock()
-		return
+		return nil
 	}
 	tab.mode = normalized
 	tab.toolApprovalMode = normalizeToolApprovalMode(tab.toolApprovalMode)
@@ -1393,36 +1413,57 @@ func (a *App) SetModeForTab(tabID, mode string) {
 	approvalMode := tab.toolApprovalMode
 	tabIDForSave := tab.ID
 	a.mu.Unlock()
-	applyTabModeToController(ctrl, normalized)
-	applyTabToolApprovalModeToController(ctrl, approvalMode)
+	drained := applyTabModeToController(ctrl, normalized)
+	drained = append(drained, applyTabToolApprovalModeToController(ctrl, approvalMode)...)
 	a.mu.Lock()
 	if a.tabs[tabIDForSave] == tab {
 		a.saveTabsLocked()
 	}
 	a.mu.Unlock()
+	return drained
 }
 
-func applyTabModeToController(ctrl control.SessionAPI, mode string) {
+// modeApplier / toolApprovalApplier are the drained-id-reporting variants of
+// SessionAPI's SetMode / SetToolApprovalMode. Asserted optionally so test
+// fakes implementing the plain SessionAPI keep compiling (they report nil).
+type modeApplier interface {
+	ApplyMode(plan, autoApproveTools bool) []string
+}
+
+type toolApprovalApplier interface {
+	ApplyToolApprovalMode(mode string) []string
+}
+
+func applyTabModeToController(ctrl control.SessionAPI, mode string) []string {
 	if ctrl == nil {
-		return
+		return nil
 	}
+	plan, yolo := false, false
 	switch normalizeTabMode(mode) {
 	case "plan":
-		ctrl.SetMode(true, false)
+		plan = true
 	case "yolo":
-		ctrl.SetMode(false, true)
+		yolo = true
 	case "plan-yolo":
-		ctrl.SetMode(true, true)
-	default:
-		ctrl.SetMode(false, false)
+		plan, yolo = true, true
 	}
+	if applier, ok := ctrl.(modeApplier); ok {
+		return applier.ApplyMode(plan, yolo)
+	}
+	ctrl.SetMode(plan, yolo)
+	return nil
 }
 
-func applyTabToolApprovalModeToController(ctrl control.SessionAPI, mode string) {
+func applyTabToolApprovalModeToController(ctrl control.SessionAPI, mode string) []string {
 	if ctrl == nil {
-		return
+		return nil
 	}
-	ctrl.SetToolApprovalMode(normalizeToolApprovalMode(mode))
+	mode = normalizeToolApprovalMode(mode)
+	if applier, ok := ctrl.(toolApprovalApplier); ok {
+		return applier.ApplyToolApprovalMode(mode)
+	}
+	ctrl.SetToolApprovalMode(mode)
+	return nil
 }
 
 func (a *App) currentModeForTab(tabID string) string {
@@ -1452,10 +1493,15 @@ func (a *App) SetCollaborationMode(mode string) {
 }
 
 func (a *App) SetCollaborationModeForTab(tabID, mode string) {
+	tab := a.tabByID(tabID)
+	if tab == nil {
+		return
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	mode = normalizeCollaborationMode(mode)
 	a.mu.Lock()
-	tab := a.tabByIDLocked(tabID)
-	if tab == nil {
+	if a.tabs[tab.ID] != tab {
 		a.mu.Unlock()
 		return
 	}
@@ -1477,7 +1523,7 @@ func (a *App) SetCollaborationModeForTab(tabID, mode string) {
 	a.mu.Unlock()
 	if ctrl != nil {
 		ctrl.SetPlanMode(plan)
-		ctrl.SetGoal(goal)
+		syncTabGoalToController(ctrl, goal)
 	}
 	a.mu.Lock()
 	if a.tabs[tabIDForSave] == tab {
@@ -1745,6 +1791,8 @@ func (a *App) clearActiveSessionRuntime(tab *WorkspaceTab, oldCtrl control.Sessi
 	// runtimeRebuildMu → sessionRemovalMu (no path acquires them in reverse).
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	// This path destroys the old session's files (removeDesktopSessionArtifacts);
 	// serialize with DeleteSession/TrashTopic/workspace removal so they never
 	// trash or restore the same files mid-clear.
@@ -3234,6 +3282,8 @@ func (a *App) rebindTabToLoadedSessionPath(tab *WorkspaceTab, sessionPath string
 	// controller can be double-closed.
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 
 	// Validate the tab, compare session keys, invalidate any in-flight async
 	// build, and snapshot the controller in ONE a.mu critical section.
@@ -4185,6 +4235,7 @@ type HistoryMessage struct {
 	Role               string                    `json:"role"`
 	Content            string                    `json:"content"`
 	Detail             string                    `json:"detail,omitempty"`
+	Code               string                    `json:"code,omitempty"`
 	SubmitText         string                    `json:"submitText,omitempty"`
 	CheckpointTurn     *int                      `json:"checkpointTurn,omitempty"`
 	Reasoning          string                    `json:"reasoning,omitempty"`
@@ -4970,6 +5021,7 @@ type previewEventRecord struct {
 	UpdatedAtSnake   json.RawMessage           `json:"updated_at"`
 	Text             string                    `json:"text"`
 	Detail           string                    `json:"detail"`
+	Code             string                    `json:"code"`
 	Content          string                    `json:"content"`
 	Reasoning        string                    `json:"reasoning"`
 	ReasoningContent string                    `json:"reasoningContent"`
@@ -5077,7 +5129,7 @@ func previewEventSessionMessages(path string) ([]HistoryMessage, bool, error) {
 			if level != "warn" {
 				level = "info"
 			}
-			out = append(out, HistoryMessage{Role: "notice", Level: level, Content: firstNonEmpty(rec.Text, rec.Content), Detail: rec.Detail})
+			out = append(out, HistoryMessage{Role: "notice", Level: level, Content: firstNonEmpty(rec.Text, rec.Content), Detail: rec.Detail, Code: rec.Code})
 		case "compaction_started":
 			c := rec.compactionPayload()
 			out = append(out, HistoryMessage{Role: "compaction", Pending: true, Trigger: c.Trigger})
@@ -5551,10 +5603,15 @@ func (a *App) SetGoal(goal string) {
 }
 
 func (a *App) SetGoalForTab(tabID, goal string) {
+	tab := a.tabByID(tabID)
+	if tab == nil {
+		return
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	goal = strings.TrimSpace(goal)
 	a.mu.Lock()
-	tab := a.tabByIDLocked(tabID)
-	if tab == nil {
+	if a.tabs[tab.ID] != tab {
 		a.mu.Unlock()
 		return
 	}
@@ -5568,7 +5625,7 @@ func (a *App) SetGoalForTab(tabID, goal string) {
 	a.mu.Unlock()
 	if ctrl != nil {
 		ctrl.SetPlanMode(plan)
-		ctrl.SetGoal(goal)
+		syncTabGoalToController(ctrl, goal)
 	}
 	a.mu.Lock()
 	if a.tabs[tabIDForSave] == tab {
@@ -5577,12 +5634,49 @@ func (a *App) SetGoalForTab(tabID, goal string) {
 	a.mu.Unlock()
 }
 
+// The composer re-syncs collaboration mode and Goal immediately before every
+// send. Keep those acknowledgements idempotent so one multi-turn Goal retains
+// its delivery scope; a terminal Goal with the same text still starts a fresh
+// scope when the user explicitly enters it again.
+func syncTabGoalToController(ctrl control.SessionAPI, goal string) {
+	if ctrl == nil {
+		return
+	}
+	goal = strings.TrimSpace(goal)
+	if goal != "" && strings.TrimSpace(ctrl.Goal()) == goal && ctrl.GoalStatus() == control.GoalStatusRunning {
+		return
+	}
+	ctrl.SetGoal(goal)
+}
+
 func (a *App) ClearGoal() {
 	a.SetGoal("")
 }
 
 func (a *App) ClearGoalForTab(tabID string) {
 	a.SetGoalForTab(tabID, "")
+}
+
+// ResumeGoalForTab re-enters a blocked or stopped Goal while preserving its
+// delivery scope and persisted verification checkpoint.
+func (a *App) ResumeGoalForTab(tabID string) bool {
+	tab := a.tabByID(tabID)
+	if tab == nil {
+		return false
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
+	ctrl := a.controllerForTab(tab)
+	if ctrl == nil || !ctrl.ResumeGoal() {
+		return false
+	}
+	a.mu.Lock()
+	if a.tabs[tab.ID] == tab {
+		tab.goal = strings.TrimSpace(ctrl.Goal())
+		a.saveTabsLocked()
+	}
+	a.mu.Unlock()
+	return true
 }
 
 // SetAutoApproveTools toggles YOLO/full-access tool auto-approval:
@@ -5605,25 +5699,33 @@ func (a *App) SetToolApprovalMode(mode string) {
 	a.SetToolApprovalModeForTab("", mode)
 }
 
-func (a *App) SetToolApprovalModeForTab(tabID, mode string) {
+// SetToolApprovalModeForTab returns the pending approval prompt ids the
+// switch auto-allowed (see SetModeForTab).
+func (a *App) SetToolApprovalModeForTab(tabID, mode string) []string {
+	tab := a.tabByID(tabID)
+	if tab == nil {
+		return nil
+	}
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	mode = normalizeToolApprovalMode(mode)
 	a.mu.Lock()
-	tab := a.tabByIDLocked(tabID)
-	if tab == nil {
+	if a.tabs[tab.ID] != tab {
 		a.mu.Unlock()
-		return
+		return nil
 	}
 	tab.toolApprovalMode = mode
 	tab.mode = tabModeFromAxes(tabModeHasPlan(currentTabMode(tab)), mode == control.ToolApprovalYolo)
 	ctrl := tab.Ctrl
 	tabIDForSave := tab.ID
 	a.mu.Unlock()
-	applyTabToolApprovalModeToController(ctrl, mode)
+	drained := applyTabToolApprovalModeToController(ctrl, mode)
 	a.mu.Lock()
 	if a.tabs[tabIDForSave] == tab {
 		a.saveTabsLocked()
 	}
 	a.mu.Unlock()
+	return drained
 }
 
 // CommandInfo describes one available slash command for the composer's "/" menu.
@@ -5811,6 +5913,7 @@ type ToolView struct {
 	Name         string `json:"name"`
 	Description  string `json:"description"`
 	ReadOnlyHint bool   `json:"readOnlyHint,omitempty"`
+	SchemaError  string `json:"schemaError,omitempty"`
 }
 
 // SkillView is one discoverable skill for the drawer. Also backs the
@@ -7188,7 +7291,9 @@ func pluginToolsToView(tools []plugin.ToolInfo) []ToolView {
 	}
 	out := make([]ToolView, 0, len(tools))
 	for _, t := range tools {
-		out = append(out, ToolView{Name: t.Name, Description: t.Description, ReadOnlyHint: t.ReadOnlyHint})
+		out = append(out, ToolView{
+			Name: t.Name, Description: t.Description, ReadOnlyHint: t.ReadOnlyHint, SchemaError: t.SchemaError,
+		})
 	}
 	return out
 }
@@ -7472,6 +7577,8 @@ func (a *App) SetModelForTab(tabID, name string) error {
 	// switch cannot interleave on one tab.
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
 		prevPath = a.currentSessionPathFor(tab)
@@ -7564,14 +7671,13 @@ func (a *App) SetModelForTab(tabID, name string) error {
 	newCtrl.EnableInteractiveApproval()
 	applyTabModeToController(newCtrl, snap.mode)
 	applyTabToolApprovalModeToController(newCtrl, snap.toolApprovalMode)
-	newCtrl.SetGoal(snap.goal)
 
 	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, "model"); err != nil {
 		newCtrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
+	resumeWithFreshSystemPromptAndGoal(newCtrl, carried, path, snap.goal)
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		// The tab was closed/replaced while we built the new controller off-lock;
@@ -7646,6 +7752,8 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 	// applyProviderEffortConfig → rebuildSetting, which takes the lock itself.
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
 		prevPath = a.currentSessionPathFor(tab)
@@ -7720,13 +7828,12 @@ func (a *App) SetEffortForTab(tabID, level string) error {
 	newCtrl.EnableInteractiveApproval()
 	applyTabModeToController(newCtrl, snap.mode)
 	applyTabToolApprovalModeToController(newCtrl, snap.toolApprovalMode)
-	newCtrl.SetGoal(snap.goal)
 	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, "effort"); err != nil {
 		newCtrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
+	resumeWithFreshSystemPromptAndGoal(newCtrl, carried, path, snap.goal)
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		a.mu.Unlock()
@@ -7775,6 +7882,8 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 	// Build+swap path; serialize with the other rebuild paths (see runtimeRebuildMu).
 	a.runtimeRebuildMu.Lock()
 	defer a.runtimeRebuildMu.Unlock()
+	tab.turnStartMu.Lock()
+	defer tab.turnStartMu.Unlock()
 	prevPath := a.reconciledSessionPathForTab(tab)
 	if prevPath == "" {
 		prevPath = a.currentSessionPathFor(tab)
@@ -7848,13 +7957,12 @@ func (a *App) SetTokenModeForTab(tabID, mode string) error {
 	newCtrl.EnableInteractiveApproval()
 	applyTabModeToController(newCtrl, snap.mode)
 	applyTabToolApprovalModeToController(newCtrl, snap.toolApprovalMode)
-	newCtrl.SetGoal(snap.goal)
 	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, "token mode"); err != nil {
 		newCtrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPrompt(newCtrl, carried, path)
+	resumeWithFreshSystemPromptAndGoal(newCtrl, carried, path, snap.goal)
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		a.mu.Unlock()

@@ -56,15 +56,37 @@ type Receipt struct {
 	OutputBytes int `json:"output_bytes,omitempty"`
 }
 
+// BackgroundLease identifies a background job whose evidence was provisionally
+// merged into the current turn's ledger. The host commits these leases only
+// after the turn passes its delivery gates, so a failed turn leaves the job's
+// evidence collectable again.
+type BackgroundLease struct {
+	Session string
+	JobID   string
+}
+
+// DeliveryCheckpoint is the compact, persistence-safe state carried across
+// runs of one host-owned Goal. It intentionally stores no raw tool arguments or
+// output. PendingMutation means a previously observed change still needs fresh
+// verification, review, and sign-off before the Goal can finalize.
+type DeliveryCheckpoint struct {
+	ScopeID             string `json:"scopeID,omitempty"`
+	CriteriaEstablished bool   `json:"criteriaEstablished,omitempty"`
+	WorkObserved        bool   `json:"workObserved,omitempty"`
+	MutationObserved    bool   `json:"mutationObserved,omitempty"`
+	PendingMutation     bool   `json:"pendingMutation,omitempty"`
+}
+
 // Ledger stores the receipts available to complete_step for the current turn.
 type Ledger struct {
-	mu       sync.Mutex
-	receipts []Receipt
+	mu               sync.Mutex
+	receipts         []Receipt
+	backgroundLeases []BackgroundLease
 }
 
 func NewLedger() *Ledger { return &Ledger{} }
 
-// Reset clears receipts between user turns.
+// Reset clears receipts and background leases between user turns.
 func (l *Ledger) Reset() {
 	if l == nil {
 		return
@@ -72,6 +94,54 @@ func (l *Ledger) Reset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.receipts = nil
+	l.backgroundLeases = nil
+}
+
+// ResetBackgroundLeases starts a new run inside the same delivery scope. The
+// durable receipts remain available, while per-run job leases must be collected
+// and committed independently.
+func (l *Ledger) ResetBackgroundLeases() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.backgroundLeases = nil
+	l.mu.Unlock()
+}
+
+// NoteBackgroundLease records that a background job's evidence was merged into
+// this turn. It returns false when the job was already noted this turn so the
+// caller can skip a duplicate merge — collection is idempotent within a turn,
+// while a fresh turn (after Reset) leases again.
+func (l *Ledger) NoteBackgroundLease(session, jobID string) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, lease := range l.backgroundLeases {
+		if lease.Session == session && lease.JobID == jobID {
+			return false
+		}
+	}
+	l.backgroundLeases = append(l.backgroundLeases, BackgroundLease{Session: session, JobID: jobID})
+	return true
+}
+
+// BackgroundLeases returns the background jobs merged into this turn, for the
+// host to commit once the turn's delivery gates pass.
+func (l *Ledger) BackgroundLeases() []BackgroundLease {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.backgroundLeases) == 0 {
+		return nil
+	}
+	out := make([]BackgroundLease, len(l.backgroundLeases))
+	copy(out, l.backgroundLeases)
+	return out
 }
 
 // Record appends a receipt. Failed receipts are retained for auditability but
@@ -323,7 +393,9 @@ func (l *Ledger) HasSuccessfulDeliverySignoffAfter(after int) bool {
 // HasSuccessfulReviewAfter reports whether the changed result was inspected
 // after the latest mutation. A read of a touched path is sufficient; git/diff
 // inspection commands cover shell-driven or delegated mutations whose paths are
-// not knowable to the host.
+// not knowable to the host. A negative index is the restored-checkpoint
+// baseline: the mutation predates this ledger (controller rebuild or cold
+// resume), so any successful review-shaped receipt counts.
 func (l *Ledger) HasSuccessfulReviewAfter(after int) bool {
 	if l == nil {
 		return false
@@ -336,17 +408,23 @@ func (l *Ledger) HasSuccessfulReviewAfter(after int) bool {
 	l.mu.Lock()
 	receipts := append([]Receipt(nil), l.receipts...)
 	l.mu.Unlock()
-	if after < 0 || after >= len(receipts) {
+	if after >= len(receipts) {
 		return false
 	}
 	return receiptsReviewChanges(receipts, start, len(receipts), after)
 }
 
 func receiptsReviewChanges(receipts []Receipt, start, end, mutationIndex int) bool {
-	if mutationIndex < 0 || mutationIndex >= len(receipts) {
+	if mutationIndex >= len(receipts) {
 		return false
 	}
-	wanted := pathSet(receipts[mutationIndex].Paths)
+	// A negative mutationIndex is the restored-checkpoint baseline: the
+	// mutation's receipt is not in this ledger, so its touched paths are
+	// unknowable and any successful review-shaped receipt counts.
+	var wanted map[string]bool
+	if mutationIndex >= 0 {
+		wanted = pathSet(receipts[mutationIndex].Paths)
+	}
 	for i := start; i < end && i < len(receipts); i++ {
 		r := receipts[i]
 		if !r.Success {
@@ -790,6 +868,7 @@ func (l *Ledger) hasSuccessfulPaths(paths []string, accept func(Receipt) bool) b
 
 type contextKey struct{}
 type sessionMessagesKey struct{}
+type deliveryProfileKey struct{}
 
 func WithLedger(ctx context.Context, ledger *Ledger) context.Context {
 	if ledger == nil {
@@ -801,6 +880,20 @@ func WithLedger(ctx context.Context, ledger *Ledger) context.Context {
 func FromContext(ctx context.Context) (*Ledger, bool) {
 	ledger, ok := ctx.Value(contextKey{}).(*Ledger)
 	return ledger, ok && ledger != nil
+}
+
+// WithDeliveryProfile marks tool execution as subject to the delivery-first
+// final-readiness contract. Tools use this only for stricter evidence validation;
+// it is ephemeral host state and is never serialized into sessions or prompts.
+func WithDeliveryProfile(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deliveryProfileKey{}, true)
+}
+
+// DeliveryProfileFromContext reports whether the current tool call must produce
+// evidence that the delivery final-readiness gate can accept.
+func DeliveryProfileFromContext(ctx context.Context) bool {
+	enabled, _ := ctx.Value(deliveryProfileKey{}).(bool)
+	return enabled
 }
 
 // WithSessionMessages attaches the full conversation history so verifyStepEvidence
@@ -998,6 +1091,14 @@ func bashCommandIsVerification(command string) bool {
 	return found
 }
 
+// IsDeliveryVerificationCommand reports whether command is a host-recognized
+// verification command for delivery finalization. Keep complete_step and the
+// final-readiness gate on this single classifier so a sign-off cannot claim a
+// command that the final gate will immediately reject.
+func IsDeliveryVerificationCommand(command string) bool {
+	return bashCommandIsVerification(command)
+}
+
 func bashSegmentIsVerification(fields []string) bool {
 	if len(fields) == 0 {
 		return false
@@ -1007,24 +1108,44 @@ func bashSegmentIsVerification(fields []string) bool {
 	if hasCommandArg(args, "--fix", "--write", "-w", "--update", "-u") {
 		return false
 	}
+	if hasWriteOutputFlag(args) {
+		return false
+	}
 	switch base {
 	case "go":
 		if len(args) == 0 {
 			return false
 		}
-		if args[0] == "test" || args[0] == "vet" {
+		if args[0] == "vet" {
+			return true
+		}
+		if args[0] == "test" {
+			for _, arg := range args[1:] {
+				if goTestFlagWritesFile(arg) {
+					return false
+				}
+			}
 			return true
 		}
 		return args[0] == "build" && !hasCommandArg(args, "-o")
 	case "git":
 		return len(args) > 1 && args[0] == "diff" && hasCommandArg(args[1:], "--check")
-	case "pytest", "py.test", "gotestsum", "staticcheck", "golangci-lint", "mypy", "tsc":
+	case "pytest", "py.test", "gotestsum", "staticcheck", "golangci-lint", "tsc":
+		return true
+	case "mypy":
+		for _, arg := range args {
+			if mypyFlagWritesReport(arg) {
+				return false
+			}
+		}
 		return true
 	case "npm", "pnpm", "yarn", "bun", "cargo":
 		if len(args) > 0 && hasCommandArg(args[:1], "test", "check", "lint", "clippy") {
 			return true
 		}
 		return len(args) > 1 && args[0] == "run" && hasCommandArg(args[1:2], "test", "check", "lint", "typecheck")
+	case "node":
+		return nodeSegmentIsVerification(args)
 	case "make", "just":
 		return len(args) > 0 && hasCommandArg(args[:1], "test", "check", "lint", "verify", "ci")
 	case "python", "python3":
@@ -1035,6 +1156,54 @@ func bashSegmentIsVerification(fields []string) bool {
 		return len(args) > 0 && hasCommandArg(args, "test", "check", "verify")
 	}
 	return false
+}
+
+func nodeSegmentIsVerification(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	// Node CLI flags are case-sensitive: -c/--check is the syntax-only mode,
+	// while -C/--conditions executes the target with custom export conditions.
+	switch args[0] {
+	case "--check", "-c":
+		// Syntax-check mode does not execute the target. Fail closed on any
+		// additional option: preload/eval/import flags could execute code before
+		// the check and turn a purported verifier into an opaque mutation.
+		for _, arg := range args[1:] {
+			if arg != "-" && strings.HasPrefix(arg, "-") {
+				return false
+			}
+		}
+		return true
+	case "--test":
+		// Match the repository's treatment of other conventional test runners,
+		// but fail closed on test-runner and Node runtime flags that write files.
+		for _, arg := range args[1:] {
+			if nodeTestFlagWritesFile(arg) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func nodeTestFlagWritesFile(arg string) bool {
+	name := strings.ToLower(arg)
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	switch name {
+	case "--cpu-prof", "--heap-prof", "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal",
+		"--localstorage-file", "--perf-basic-prof", "--perf-basic-prof-only-functions", "--perf-prof",
+		"--prof", "--redirect-warnings", "--report-on-fatalerror", "--report-on-signal",
+		"--report-uncaught-exception", "--test-reporter-destination", "--test-rerun-failures",
+		"--test-update-snapshots", "--tls-keylog", "--trace-events-enabled":
+		return true
+	default:
+		return false
+	}
 }
 
 func bashReadOnlyCommandWrites(base, sub string, fields []string) bool {
@@ -1074,6 +1243,92 @@ func hasCommandArg(args []string, candidates ...string) bool {
 		}
 	}
 	return false
+}
+
+// writeOutputFlags are test-runner and linter flags that write snapshot,
+// report, or profile files. Snapshot flags rewrite checked-in fixtures (the
+// --update/-u class rejected above); the others write explicit output paths.
+// A runner invoked with one of them changes workspace state, so the segment
+// must not count as read-only verification.
+var writeOutputFlags = map[string]bool{
+	"snapshot-update": true, // pytest-snapshot / syrupy
+	"updatesnapshot":  true, // jest --updateSnapshot via npm/yarn wrappers
+	"junitxml":        true, // pytest
+	"junit-xml":       true, // pytest / mypy
+	"junitfile":       true, // gotestsum
+	"jsonfile":        true, // gotestsum
+	"coverprofile":    true, // go test
+	"cpuprofile":      true, // go test
+	"memprofile":      true, // go test
+	"blockprofile":    true, // go test
+	"mutexprofile":    true, // go test
+	"testlogfile":     true, // go test binary
+	"gocoverdir":      true, // go test binary
+	"outputfile":      true, // jest/vitest --outputFile (with --json)
+	"report-log":      true, // pytest-reportlog
+}
+
+func hasWriteOutputFlag(args []string) bool {
+	for _, arg := range args {
+		name := strings.TrimLeft(arg, "-")
+		if len(name) == len(arg) || name == "" {
+			continue // not a flag
+		}
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		// go test flags accept an optional test. prefix (-test.coverprofile)
+		// that the go tool passes through to the test binary.
+		name = strings.TrimPrefix(strings.ToLower(name), "test.")
+		if writeOutputFlags[name] {
+			return true
+		}
+		// Vitest exposes dotted per-reporter forms (--outputFile.json=path).
+		if i := strings.IndexByte(name, '.'); i > 0 && writeOutputFlags[name[:i]] {
+			return true
+		}
+	}
+	return false
+}
+
+// mypyFlagWritesReport reports whether a mypy flag writes a report directory:
+// every mypy report option follows the --<type>-report DIR shape (txt, html,
+// xml, cobertura-xml, any-exprs, linecount, linecoverage, lineprecision), and
+// mypy has no read-only flag with that suffix. --junit-xml is covered by the
+// global write-output flags.
+func mypyFlagWritesReport(arg string) bool {
+	name := strings.ToLower(arg)
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	return strings.HasPrefix(name, "--") && strings.HasSuffix(name, "-report")
+}
+
+// goTestFlagWritesFile reports whether a go test flag writes a workspace
+// artifact: -c/-o emit the test binary, -trace and the profile flags write
+// profiles, and -artifacts/-testlogfile/-gocoverdir write test outputs. The
+// short and ambiguous names stay out of writeOutputFlags because the
+// dash-stripped global match would also hit node -c (a syntax-only check)
+// and pytest --trace (a read-only debugger flag). go test flags accept
+// single- and double-dash forms and an optional test. prefix that the go
+// tool passes through to the test binary.
+func goTestFlagWritesFile(arg string) bool {
+	name := strings.ToLower(arg)
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	trimmed := strings.TrimLeft(name, "-")
+	if len(trimmed) == len(name) || trimmed == "" {
+		return false // not a flag
+	}
+	trimmed = strings.TrimPrefix(trimmed, "test.")
+	switch trimmed {
+	case "c", "o", "trace", "artifacts", "testlogfile", "gocoverdir",
+		"coverprofile", "cpuprofile", "memprofile", "blockprofile", "mutexprofile":
+		return true
+	default:
+		return false
+	}
 }
 
 func completeStepVerificationCommands(args json.RawMessage) []string {

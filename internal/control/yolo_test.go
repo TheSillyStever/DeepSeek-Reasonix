@@ -228,6 +228,37 @@ func TestToolApprovalModeYoloForcesMemoryAskRules(t *testing.T) {
 	}
 }
 
+func TestToolApprovalModeDontAskDeniesWithoutPrompt(t *testing.T) {
+	requests := 0
+	c := New(Options{
+		Policy: permission.New("ask", nil, []string{"bash(git commit*)"}, nil).
+			WithSessionAllow([]string{"bash(go test*)"}),
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				requests++
+			}
+		}),
+	})
+	c.SetToolApprovalMode(ToolApprovalDontAsk)
+	gate := c.newInteractiveGate()
+
+	allow, _, err := gate.Check(context.Background(), "bash", json.RawMessage(`{"command":"go test ./..."}`), false)
+	if err != nil || !allow {
+		t.Fatalf("session-allowed call = (%v, %v), want allow", allow, err)
+	}
+	allow, _, err = gate.Check(context.Background(), "bash", json.RawMessage(`{"command":"git commit -m x"}`), false)
+	if err != nil || allow {
+		t.Fatalf("explicit ask under dontAsk = (%v, %v), want deny", allow, err)
+	}
+	allow, _, err = gate.Check(context.Background(), "write_file", json.RawMessage(`{"path":"x.txt"}`), false)
+	if err != nil || allow {
+		t.Fatalf("fallback under dontAsk = (%v, %v), want deny", allow, err)
+	}
+	if requests != 0 {
+		t.Fatalf("dontAsk emitted %d approval requests, want 0", requests)
+	}
+}
+
 func TestToolApprovalModeAutoDrainsPendingFallbackApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -1101,5 +1132,61 @@ func TestAskSerializesBehindPromptLockEvenWithBypass(t *testing.T) {
 	}
 	if len(answers) != 1 || answers[0].QuestionID != "q1" || len(answers[0].Selected) != 1 || answers[0].Selected[0] != "Alternative" {
 		t.Fatalf("answers = %#v, want Alternative (user's choice, not auto-recommended)", answers)
+	}
+}
+
+// TestApplyToolApprovalModeReportsDrainedIDs pins the drain-report contract
+// the desktop frontend relies on (#6432): a posture switch returns exactly
+// the pending approval ids it auto-allowed, so the UI dismisses those cards
+// and keeps the ones still pending here. Fresh user decisions (plan) never
+// drain, and auto keeps approvals an allow policy would not cover.
+func TestApplyToolApprovalModeReportsDrainedIDs(t *testing.T) {
+	c := New(Options{
+		Policy: permission.New("ask", nil, []string{"bash(git commit*)"}, nil),
+	})
+
+	autoOKID, autoOKReply := c.approval.register("bash", "go test ./...", "")
+	askRuleID, askRuleReply := c.approval.register("bash", "git commit -m x", "")
+	planID, planReply := c.approval.registerDecision(planApprovalTool, "", "", true)
+
+	drained := c.ApplyToolApprovalMode(ToolApprovalAuto)
+	if len(drained) != 1 || drained[0] != autoOKID {
+		t.Fatalf("auto drained = %v, want [%s]", drained, autoOKID)
+	}
+	select {
+	case r := <-autoOKReply:
+		if !r.allow {
+			t.Fatal("auto-drained approval must be auto-allowed")
+		}
+	default:
+		t.Fatal("auto-drained approval reply not signaled")
+	}
+	select {
+	case <-askRuleReply:
+		t.Fatal("explicit ask-rule approval must stay pending under auto")
+	default:
+	}
+
+	drained = c.ApplyToolApprovalMode(ToolApprovalYolo)
+	if len(drained) != 1 || drained[0] != askRuleID {
+		t.Fatalf("yolo drained = %v, want [%s]", drained, askRuleID)
+	}
+	select {
+	case r := <-askRuleReply:
+		if !r.allow {
+			t.Fatal("yolo-drained approval must be auto-allowed")
+		}
+	default:
+		t.Fatal("yolo-drained approval reply not signaled")
+	}
+
+	// The fresh plan decision survives both switches and stays pending.
+	select {
+	case <-planReply:
+		t.Fatal("fresh plan approval must never drain on a posture switch")
+	default:
+	}
+	if !c.approval.hasPending() {
+		t.Fatalf("plan approval %s should still be pending", planID)
 	}
 }

@@ -45,6 +45,7 @@ export interface WireTool {
   truncated?: boolean;
   durationMs?: number;
   partial?: boolean; // an early dispatch (name only) — a full one with args follows
+  argChars?: number; // partial only: cumulative argument chars streamed so far
   parentId?: string; // set on a sub-agent's calls — the parent `task` call's id
   diff?: string;
   added?: number;
@@ -156,6 +157,8 @@ export interface WireEvent {
   kind: EventKind;
   text?: string;
   detail?: string;
+  // Stable notice id for localization; empty/absent = localize by text match.
+  code?: string;
   reasoning?: string;
   memoryCitations?: MemoryCitation[];
   memoryCompiler?: MemoryCompilerStats;
@@ -167,6 +170,7 @@ export interface WireEvent {
   compaction?: WireCompaction;
   guardian?: WireGuardian;
   err?: string;
+  outcome?: "final_readiness";
   retryAttempt?: number;
   retryMax?: number;
   // Tab routing: set by the Go-side tabEventSink so multi-tab frontends
@@ -326,6 +330,7 @@ export interface HistoryMessage {
   role: string;
   content: string;
   detail?: string;
+  code?: string;
   submitText?: string;
   checkpointTurn?: number;
   createdAt?: number;
@@ -691,6 +696,7 @@ export interface MCPToolView {
   name: string;
   description: string;
   readOnlyHint?: boolean;
+  schemaError?: string;
 }
 export interface SkillView {
   name: string;
@@ -1378,6 +1384,20 @@ export interface DesktopStartupSettingsView {
   statusBarStyle: string; // "icon" | "text"
   statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
+}
+
+export type ExternalOpenerKind = "file-manager" | "editor" | "terminal";
+
+export interface ExternalOpenerView {
+  id: string;
+  name: string;
+  kind: ExternalOpenerKind;
+  iconDataUrl?: string;
+}
+
+export interface ExternalOpenersView {
+  openers: ExternalOpenerView[];
+  preferred: string;
 }
 
 // Auto-updater payloads (desktop/updater.go). UpdateInfo drives the update banner;
