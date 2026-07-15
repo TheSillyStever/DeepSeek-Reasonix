@@ -2914,6 +2914,12 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 	buildSink := tab.sink
 	a.saveTabsLocked()
 	a.mu.Unlock()
+	buildRuntime := (tabRuntimeSnapshot{
+		tokenMode:        buildTokenMode,
+		mode:             buildMode,
+		goal:             buildGoal,
+		toolApprovalMode: buildToolApprovalMode,
+	}).normalizedRuntime()
 
 	sharedHost := a.acquireSharedHost(rootKey)
 	sink := a.desktopControllerSink(buildSink, cfg.Notifications)
@@ -2959,11 +2965,10 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 	}
 
 	a.bindControllerDisplayRecorder(ctrl)
-	ctrl.EnableInteractiveApproval()
-	applyTabModeToController(ctrl, buildMode)
-	applyTabToolApprovalModeToController(ctrl, buildToolApprovalMode)
+	configureControllerRuntime(ctrl, nil, buildRuntime)
 
 	acquiredLeaseKey := ""
+	restoredRuntime := buildRuntime
 	if dir := ctrl.SessionDir(); dir != "" {
 		migratedTopics := migrateLegacySessionsIntoGlobalTopics(dir)
 		if len(migratedTopics) > 0 {
@@ -3062,11 +3067,30 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 				a.abandonSupersededBuild(tab, ctrl, rootKey, acquiredLeaseKey)
 				return
 			}
-			if resumeSession != nil {
-				resumeLoadedSessionAndGoal(ctrl, resumeSession, path, buildGoal)
-			} else {
-				ctrl.SetSessionPath(path)
-				ctrl.SetGoal(buildGoal)
+			var restoreErr error
+			restoredRuntime, restoreErr = resumeControllerRuntimeWithSession(ctrl, resumeSession, path, buildRuntime)
+			if restoreErr != nil {
+				leaseHeld := false
+				a.mu.Lock()
+				if a.tabBuildSupersededLocked(tab, buildGeneration) {
+					a.mu.Unlock()
+					a.abandonSupersededBuild(tab, ctrl, rootKey, acquiredLeaseKey)
+					return
+				}
+				leaseHeld = setTabStartupError(tab, restoreErr)
+				tab.Ready = true
+				hostKey := takeTabSharedHostKey(tab)
+				tab.releaseSessionLeaseForKey(sessionRuntimeKey(path))
+				a.mu.Unlock()
+				ctrl.Close()
+				if hostKey != "" {
+					a.releaseSharedHost(hostKey)
+				}
+				if leaseHeld {
+					a.scheduleDeferredStartupBuild(tab.ID)
+				}
+				a.emitReady(wailsCtx, tab.ID)
+				return
 			}
 			a.persistTabSessionPath(tab, path)
 			a.mu.RLock()
@@ -3103,6 +3127,7 @@ func (a *App) buildTabControllerWithContext(tab *WorkspaceTab, loadedSession loa
 	}
 	tab.Ctrl = ctrl
 	tab.Label = ctrl.Label()
+	applyNormalizedRuntimeToTabLocked(tab, restoredRuntime)
 	tab.Ready = true
 	clearTabStartupError(tab)
 	keepBuildContext = true
@@ -3243,7 +3268,11 @@ func sessionBindingWorkspaceNotice(oldScope, oldWorkspaceRoot, scope, workspaceR
 
 func describeSessionBindingWorkspace(scope, workspaceRoot string) string {
 	if strings.TrimSpace(scope) == "project" && strings.TrimSpace(workspaceRoot) != "" {
-		return fmt.Sprintf("project workspace %q", strings.TrimSpace(workspaceRoot))
+		// %q escapes Windows separators, which turns a user-facing path into
+		// C:\\Users\\... in the notice. Preserve native separators while escaping
+		// only the delimiters that can appear in a Unix path.
+		root := strings.ReplaceAll(strings.TrimSpace(workspaceRoot), `"`, `\"`)
+		return `project workspace "` + root + `"`
 	}
 	return "global workspace"
 }
@@ -3922,6 +3951,13 @@ func (a *App) saveTabsCollectLocked() (string, []desktopTabEntry, string, uint64
 // writes must be serialized because every save uses the same destination and
 // fixed .tmp path.
 func (a *App) saveTabsWrite(dir string, entries []desktopTabEntry, activeID string, version uint64) {
+	// Safe Mode runs on a temporary tab set that must never persist: writing it
+	// would replace desktop-tabs.json and destroy the saved layout the next
+	// normal boot restores. This is the single choke point every tab-snapshot
+	// write funnels through, so gating here covers build, close, and GC paths.
+	if config.SafeModeRequested() {
+		return
+	}
 	a.tabsSaveMu.Lock()
 	defer a.tabsSaveMu.Unlock()
 	if version < a.tabsLastWrittenVersion {
@@ -7246,6 +7282,16 @@ type tabRuntimeSnapshot struct {
 	toolApprovalMode string
 }
 
+// normalizedTabRuntime is the internal, orthogonal runtime profile restored
+// across controller rebuilds. Goal sidecars remain authoritative; legacyGoal is
+// only a fallback for a running legacy Goal with no sidecar.
+type normalizedTabRuntime struct {
+	collaborationMode string
+	toolApprovalMode  string
+	tokenMode         string
+	legacyGoal        string
+}
+
 // snapshotTabRuntimeLocked copies the racy per-tab fields. Callers must hold
 // a.mu (read or write side).
 func snapshotTabRuntimeLocked(tab *WorkspaceTab) tabRuntimeSnapshot {
@@ -7329,6 +7375,57 @@ func (s tabRuntimeSnapshot) currentToolApprovalMode() string {
 
 func (s tabRuntimeSnapshot) currentTokenMode() string {
 	return boot.NormalizeTokenMode(s.tokenMode)
+}
+
+// normalizedRuntime reads live Controller state only after the App snapshot has
+// released a.mu. Rebuild callers hold turnStartMu while invoking it, so all
+// three axes and the legacy Goal fallback describe one admitted runtime state.
+func (s tabRuntimeSnapshot) normalizedRuntime() normalizedTabRuntime {
+	plan := tabModeHasPlan(normalizeTabMode(s.mode))
+	approvalMode := normalizeToolApprovalMode(s.toolApprovalMode)
+	goal := strings.TrimSpace(s.goal)
+	goalStatus := control.GoalStatusStopped
+	if goal != "" {
+		goalStatus = control.GoalStatusRunning
+	}
+	if s.ctrl != nil {
+		plan = s.ctrl.PlanMode()
+		approvalMode = normalizeToolApprovalMode(s.ctrl.ToolApprovalMode())
+		goal = strings.TrimSpace(s.ctrl.Goal())
+		goalStatus = s.ctrl.GoalStatus()
+	}
+
+	runtime := normalizedTabRuntime{
+		collaborationMode: "normal",
+		toolApprovalMode:  approvalMode,
+		tokenMode:         boot.NormalizeTokenMode(s.tokenMode),
+	}
+	switch {
+	case plan:
+		runtime.collaborationMode = "plan"
+	case goal != "" && goalStatus == control.GoalStatusRunning:
+		runtime.collaborationMode = "goal"
+		runtime.legacyGoal = goal
+	}
+	return runtime
+}
+
+func (r normalizedTabRuntime) tabMode() string {
+	return tabModeFromAxes(r.collaborationMode == "plan", r.toolApprovalMode == control.ToolApprovalYolo)
+}
+
+func applyNormalizedRuntimeToTabLocked(tab *WorkspaceTab, runtime normalizedTabRuntime) {
+	if tab == nil {
+		return
+	}
+	tab.mode = runtime.tabMode()
+	tab.toolApprovalMode = normalizeToolApprovalMode(runtime.toolApprovalMode)
+	tab.tokenMode = boot.NormalizeTokenMode(runtime.tokenMode)
+	if runtime.collaborationMode == "goal" {
+		tab.goal = strings.TrimSpace(runtime.legacyGoal)
+	} else {
+		tab.goal = ""
+	}
 }
 
 func persistedTabTokenMode(mode string) string {

@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
+	"reasonix/internal/fileutil"
 	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/provider"
 )
@@ -42,6 +44,9 @@ func LoadForRootReadOnly(root string) (*Config, error) {
 
 func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	root = resolveRoot(root)
+	if SafeModeRequested() {
+		return loadSafeModeForRoot(root), nil
+	}
 	expansionEnv := loadDotEnvForRoot(root)
 	cfg := Default()
 	cfg.setExpansionEnv(expansionEnv)
@@ -66,8 +71,6 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 		}
 		userDefaultModelExplicit = tomlFileDefinesKey(uc, "default_model")
 	}
-	globalMaxSteps := cfg.Agent.MaxSteps
-	globalPlannerMaxSteps := cfg.Agent.PlannerMaxSteps
 	globalMemoryCompiler := cfg.Agent.MemoryCompiler
 	userDefaultModel := cfg.DefaultModel
 	// Deep-copy: TOML decoding writes through an existing *bool rather than
@@ -83,11 +86,6 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	if err := mergeTOML(cfg, projectTOML); err != nil {
 		return nil, err
 	}
-	// Runtime step caps are user/global controls, not project policy. Keep the
-	// project config's other fields, but do not let ./reasonix.toml override
-	// the user's execution and planner round limits.
-	cfg.Agent.MaxSteps = globalMaxSteps
-	cfg.Agent.PlannerMaxSteps = globalPlannerMaxSteps
 	cfg.Agent.MemoryCompiler = globalMemoryCompiler
 	// Secret protection is a user-global security control: a cloned repo's
 	// reasonix.toml must not be able to disable redaction or flip on the
@@ -126,6 +124,9 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	for i := range entries {
+		entries[i] = restrictProjectMCPApprovalPolicy(entries[i])
+	}
 	cfg.mergeMCPJSON(entries)
 
 	// Lowest priority before the one-time v1.9.1 MCP migration: the v0.x
@@ -138,6 +139,7 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	_ = mergeInstalledPluginPackages(cfg, root)
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
+	cfg.ignoredLegacyStepLimits = normalizeLegacyAgentStepLimits(cfg)
 	normalizeLegacyMCPTiers(cfg)
 	normalizeLegacyStepFunBaseURLs(cfg)
 	normalizeLegacyMimoCustomProviders(cfg)
@@ -157,6 +159,51 @@ func loadForRoot(root string, migrateOnDisk bool) (*Config, error) {
 	resolveProviderCredentialsForRoot(root, cfg)
 	return cfg, nil
 }
+
+// SafeModeRequested reports whether this process should ignore user/project
+// runtime extensions and boot from built-in defaults. The environment switch is
+// intentionally process-local; it never rewrites user configuration.
+func SafeModeRequested() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("REASONIX_SAFE_MODE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadSafeModeForRoot(root string) *Config {
+	cfg := Default()
+	cfg.safeMode = true
+	cfg.Plugins = nil
+	cfg.Skills = SkillsConfig{}
+	cfg.Bot.Enabled = false
+	cfg.Bot.Connections = nil
+	cfg.Bot.Routes = nil
+	cfg.Statusline.Command = ""
+	cfg.LSP.Enabled = false
+	cfg.Desktop.CheckUpdates = safeModeBoolPtr(false)
+	// A Safe Mode boot never reads the user's config, so it cannot see (and
+	// must not override) a telemetry/metrics opt-out recorded there. Force
+	// every reporting path off instead of inheriting the enabled defaults.
+	cfg.Desktop.Telemetry = safeModeBoolPtr(false)
+	cfg.Desktop.Metrics = safeModeBoolPtr(false)
+	cfg.setExpansionEnv(nil)
+	cfg.CredentialsStore = credentialsStoreMode()
+	resolveProviderCredentialsForRoot(root, cfg)
+	return cfg
+}
+
+// LoadRecoveryDefaultsForRoot returns the same built-in-only configuration used
+// by Safe Mode without reading or migrating user/project TOML. Recovery tools use
+// it to reach an explicitly selected built-in provider when configuration is
+// malformed; provider credentials still resolve only from Reasonix's global
+// credential store.
+func LoadRecoveryDefaultsForRoot(root string) *Config {
+	return loadSafeModeForRoot(root)
+}
+
+func safeModeBoolPtr(v bool) *bool { return &v }
 
 func (c *Config) setExpansionEnv(env map[string]string) {
 	if c == nil {
@@ -337,6 +384,7 @@ func normalizeLegacyEffort(c *Config) {
 func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 	var merged []PluginEntry
 	index := map[string]int{}
+	userApprovalPolicies := map[string]PluginEntry{}
 	for _, path := range paths {
 		if _, err := os.Stat(path); err != nil {
 			continue
@@ -347,6 +395,14 @@ func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 		}
 		for _, p := range f.Plugins {
 			p, _ = NormalizePluginCommandLine(p)
+			if isUserConfigPath(path) {
+				userApprovalPolicies[p.Name] = p
+			} else {
+				p = restrictProjectMCPApprovalPolicy(p)
+				if userPolicy, ok := userApprovalPolicies[p.Name]; ok {
+					p = inheritUserMCPApprovalPolicy(p, userPolicy)
+				}
+			}
 			if i, ok := index[p.Name]; ok {
 				merged[i] = p
 				continue
@@ -356,6 +412,47 @@ func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 		}
 	}
 	return merged, nil
+}
+
+func inheritUserMCPApprovalPolicy(project, user PluginEntry) PluginEntry {
+	project.DefaultToolsApprovalMode = user.DefaultToolsApprovalMode
+	project.Tools = cloneMCPToolPolicies(user.Tools)
+	project.ApprovalsReviewer = user.ApprovalsReviewer
+	return project
+}
+
+// restrictProjectMCPApprovalPolicy keeps repository-controlled configuration
+// monotonic with the user's global permission posture. Project files may make
+// MCP calls stricter, but cannot silently auto-approve writers or route a human
+// prompt to an automated reviewer.
+func restrictProjectMCPApprovalPolicy(p PluginEntry) PluginEntry {
+	if strings.EqualFold(strings.TrimSpace(p.DefaultToolsApprovalMode), "approve") {
+		p.DefaultToolsApprovalMode = "auto"
+	}
+	if len(p.Tools) > 0 {
+		p.Tools = cloneMCPToolPolicies(p.Tools)
+		for name, policy := range p.Tools {
+			if strings.EqualFold(strings.TrimSpace(policy.ApprovalMode), "approve") {
+				policy.ApprovalMode = "auto"
+				p.Tools[name] = policy
+			}
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(p.ApprovalsReviewer), "auto_review") {
+		p.ApprovalsReviewer = "user"
+	}
+	return p
+}
+
+func cloneMCPToolPolicies(in map[string]MCPToolPolicy) map[string]MCPToolPolicy {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]MCPToolPolicy, len(in))
+	for name, policy := range in {
+		out[name] = policy
+	}
+	return out
 }
 
 // mergeTOMLProviders merges [[providers]] across TOML sources by provider name.
@@ -510,6 +607,26 @@ func LoadForEditReadOnlyStrict(path string) (*Config, error) {
 	return loadForEditStrict(path, true, false)
 }
 
+// ValidateFile parses one TOML config in isolation without loading credentials,
+// applying migrations, or writing the file. A missing file is valid.
+func ValidateFile(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	cfg := Default()
+	if _, err := decodeTOMLFile(path, cfg); err != nil {
+		return fmt.Errorf("config %s: %w", path, err)
+	}
+	return nil
+}
+
 func loadForEdit(path string, loadCredentials, persistMigrations bool) *Config {
 	cfg, err := loadForEditStrict(path, loadCredentials, persistMigrations)
 	if err == nil {
@@ -557,6 +674,7 @@ func loadForEditStrict(path string, loadCredentials, persistMigrations bool) (*C
 func normalizeConfigForEdit(cfg *Config) bool {
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
+	normalizeLegacyAgentStepLimits(cfg)
 	normalizeLegacyMCPTiers(cfg)
 	changed := normalizeLegacyStepFunBaseURLs(cfg)
 	changed = normalizeLegacyMimoCustomProviders(cfg) || changed
@@ -609,6 +727,100 @@ func normalizeLegacyMCPTiers(c *Config) {
 	}
 }
 
+// normalizeLegacyAgentStepLimits keeps old TOML readable without allowing a
+// stale hidden value to override the adaptive progress policy. The fields stay
+// in AgentConfig for decoder and cross-version desktop compatibility only.
+func normalizeLegacyAgentStepLimits(c *Config) bool {
+	if c == nil {
+		return false
+	}
+	found := c.Agent.MaxSteps != 0 || c.Agent.PlannerMaxSteps != 0
+	c.Agent.MaxSteps = 0
+	c.Agent.PlannerMaxSteps = 0
+	return found
+}
+
+var legacyAgentStepLimitMigrationMu sync.Mutex
+
+// MigrateLegacyAgentStepLimitsForRoot removes retired [agent] step-limit keys
+// from the user and project config selected for root. Boot calls it immediately
+// before LoadForRoot, so config-only/read-only commands never rewrite files and
+// the runtime can surface exactly one migration notice.
+func MigrateLegacyAgentStepLimitsForRoot(root string) (bool, error) {
+	root = resolveRoot(root)
+	paths := make([]string, 0, 2)
+	if userPath := userConfigLoadPath(); userPath != "" {
+		paths = append(paths, userPath)
+	}
+	projectPath := "reasonix.toml"
+	if root != "." {
+		projectPath = filepath.Join(root, "reasonix.toml")
+	}
+	paths = append(paths, projectPath)
+
+	changedAny := false
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		changed, err := migrateLegacyAgentStepLimitsFile(path)
+		if err != nil {
+			return changedAny, fmt.Errorf("migrate deprecated agent step limits in %s: %w", path, err)
+		}
+		changedAny = changedAny || changed
+	}
+	return changedAny, nil
+}
+
+// migrateLegacyAgentStepLimitsFile removes retired [agent] step-limit keys
+// before runtime decoding. A process-wide lock makes concurrent desktop tab
+// builds observe a single migration; the atomic rewrite protects other readers.
+func migrateLegacyAgentStepLimitsFile(path string) (bool, error) {
+	legacyAgentStepLimitMigrationMu.Lock()
+	defer legacyAgentStepLimitMigrationMu.Unlock()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	raw, err := fileencoding.ReadFileUTF8(path)
+	if err != nil {
+		return false, err
+	}
+	next, changed := stripLegacyAgentStepLimitLines(string(raw))
+	if !changed {
+		return false, nil
+	}
+	if err := fileutil.AtomicWriteFile(path, []byte(next), info.Mode().Perm()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func stripLegacyAgentStepLimitLines(raw string) (string, bool) {
+	lines := strings.Split(raw, "\n")
+	section := ""
+	changed := false
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if header := tomlSectionHeader(line); header != "" {
+			section = header
+		}
+		if section == "agent" && (isTOMLKeyAssignment(line, "max_steps") || isTOMLKeyAssignment(line, "planner_max_steps")) {
+			changed = true
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n"), changed
+}
+
 func migrateLegacyMCPTiersFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -651,12 +863,13 @@ func tomlSectionHeader(line string) string {
 	if i := strings.Index(trimmed, "#"); i >= 0 {
 		trimmed = strings.TrimSpace(trimmed[:i])
 	}
-	switch trimmed {
-	case "[[plugins]]":
-		return "plugins"
-	default:
-		return "other"
+	if strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]") {
+		return strings.TrimSpace(trimmed[2 : len(trimmed)-2])
 	}
+	if strings.HasSuffix(trimmed, "]") {
+		return strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	}
+	return "other"
 }
 
 func isTOMLKeyAssignment(line, key string) bool {

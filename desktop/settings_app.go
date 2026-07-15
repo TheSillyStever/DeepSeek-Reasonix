@@ -302,6 +302,7 @@ type DesktopStartupSettingsView struct {
 	StatusBarStyle     string          `json:"statusBarStyle"`
 	StatusBarItems     []string        `json:"statusBarItems"`
 	CheckUpdates       bool            `json:"checkUpdates"`
+	SafeMode           bool            `json:"safeMode,omitempty"`
 }
 
 func nonNil(s []string) []string {
@@ -768,6 +769,7 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 		StatusBarStyle:     cfg.DesktopStatusBarStyle(),
 		StatusBarItems:     cfg.DesktopStatusBarItems(),
 		CheckUpdates:       cfg.DesktopCheckUpdates(),
+		SafeMode:           cfg.SafeMode(),
 	}
 }
 
@@ -777,9 +779,13 @@ func desktopStartupSettingsFromConfig(cfg *config.Config) DesktopStartupSettings
 func (a *App) DesktopStartupSettings() DesktopStartupSettingsView {
 	cfg, _, err := a.loadDesktopUserConfigForView()
 	if err != nil {
-		return desktopStartupSettingsFromConfig(nil)
+		view := desktopStartupSettingsFromConfig(nil)
+		view.SafeMode = config.SafeModeRequested()
+		return view
 	}
-	return desktopStartupSettingsFromConfig(cfg)
+	view := desktopStartupSettingsFromConfig(cfg)
+	view.SafeMode = config.SafeModeRequested()
+	return view
 }
 
 // Settings returns the current configuration for the Settings panel.
@@ -1558,6 +1564,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		carried = oldCtrl.History()
 	}
 	snap := a.tabRuntimeSnapshot(tab)
+	runtime := snap.normalizedRuntime()
 	model := snap.model
 	if cfg, err := config.LoadForRoot(snap.workspaceRoot); err == nil {
 		if resolved, fallback, ok := cfg.ResolveModelWithFallback(model); ok {
@@ -1574,7 +1581,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		WorkspaceRoot:            snap.workspaceRoot,
 		SessionDir:               sessionDirForSnapshot(snap),
 		EffortOverride:           cloneStringPtr(snap.effort),
-		TokenMode:                snap.currentTokenMode(),
+		TokenMode:                runtime.tokenMode,
 		SharedHost:               sharedHost,
 		CleanupPendingReconciler: reconcileDesktopCleanupPending,
 		SessionRecoveryMeta:      a.tabSessionRecoveryMeta(tab),
@@ -1595,21 +1602,17 @@ func (a *App) rebuildSettingLocked(setting string) error {
 		return err
 	}
 	a.bindControllerDisplayRecorder(ctrl)
-	ctrl.EnableInteractiveApproval()
-	applyTabModeToController(ctrl, snap.mode)
-	// applyTabModeToController only encodes plan+yolo from tab.mode.
-	// Apply the explicit toolApprovalMode (ask/auto/yolo) afterwards so
-	// "auto" is not lost — otherwise rebuild would silently downgrade
-	// auto to ask (#5424 regression).
-	if mode := strings.TrimSpace(snap.toolApprovalMode); mode != "" {
-		applyTabToolApprovalModeToController(ctrl, mode)
-	}
+	configureControllerRuntime(ctrl, oldCtrl, runtime)
 	path := agent.ContinueSessionPath(prevPath, ctrl.SessionDir(), ctrl.Label())
 	if err := a.ensureTabSessionLeaseForRebuild(tab, path, setting); err != nil {
 		ctrl.Close()
 		return err
 	}
-	resumeWithFreshSystemPromptAndGoal(ctrl, carried, path, snap.goal)
+	restoredRuntime, err := resumeControllerRuntimeWithMessages(ctrl, carried, path, runtime)
+	if err != nil {
+		ctrl.Close()
+		return err
+	}
 	a.mu.Lock()
 	if current := a.tabs[tab.ID]; current != tab {
 		a.mu.Unlock()
@@ -1620,6 +1623,7 @@ func (a *App) rebuildSettingLocked(setting string) error {
 	tab.Ctrl = ctrl
 	tab.model = model
 	tab.Label = ctrl.Label()
+	applyNormalizedRuntimeToTabLocked(tab, restoredRuntime)
 	clearTabStartupError(tab)
 	tab.Ready = true
 	// Supersede any in-flight startup build: it would otherwise finish later,
@@ -1836,7 +1840,7 @@ func (a *App) SetMaxSubagentDepth(depth int) error {
 	})
 }
 
-// SetAutoPlan updates the automatic plan-mode gate (off|on).
+// SetAutoPlan updates the automatic plan-first workflow setting (off|on).
 func (a *App) SetAutoPlan(mode string) error {
 	if err := a.ensureLiveControllersRuntimeMutationAllowed("auto-plan"); err != nil {
 		return err
@@ -3061,13 +3065,14 @@ func (a *App) MigrateDesktopPreferences(language, theme, style string) error {
 	})
 }
 
-// SetAgentParams updates sampling temperature, optional step guards, and the
-// base system prompt.
+// SetAgentParams updates sampling temperature and the base system prompt. The
+// step arguments remain in the Wails contract for older frontends, but are
+// retired and deliberately normalized to automatic execution.
 func (a *App) SetAgentParams(temperature float64, maxSteps int, plannerMaxSteps int, systemPrompt string) error {
 	return a.applyConfigChange(func(c *config.Config) error {
 		c.Agent.Temperature = temperature
-		c.Agent.MaxSteps = maxSteps
-		c.Agent.PlannerMaxSteps = plannerMaxSteps
+		c.Agent.MaxSteps = 0
+		c.Agent.PlannerMaxSteps = 0
 		c.Agent.SystemPrompt = systemPrompt
 		return nil
 	})

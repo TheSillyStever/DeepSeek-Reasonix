@@ -16,6 +16,7 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
+	"reasonix/internal/permission"
 	"reasonix/internal/planmode"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
@@ -180,17 +181,16 @@ func (b readOnlyBash) Description() string {
 		desc = "Execute a command in the shell and return combined stdout/stderr."
 	}
 	desc = strings.Replace(desc, "Execute a command in the shell", "Execute a foreground read-only command in the shell", 1)
-	return desc + " Only plan-mode safe read-only commands are allowed; shell operators, background execution, process preservation, and write-capable arguments are blocked."
+	return desc + " Only permission-classified read-only commands are allowed; shell operators, background execution, process preservation, and write-capable arguments are blocked."
 }
 
 func (readOnlyBash) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Read-only shell command to execute in the foreground. Must match the plan-mode safe bash policy."}},"required":["command"]}`)
+	return json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Read-only shell command to execute in the foreground. Must match the permission-layer read-only command policy."}},"required":["command"]}`)
 }
 
 func (b readOnlyBash) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	decision := planmode.Policy{}.Decide(planmode.Call{Name: "bash", Args: args})
-	if decision.Blocked {
-		return decision.Message, nil
+	if !permission.BashCommandIsReadOnly(args) {
+		return "blocked: read-only subagents can run only permission-classified foreground read-only commands", nil
 	}
 	return b.inner.Execute(ctx, args)
 }
@@ -355,7 +355,7 @@ func NewReadOnlyTaskTool(task *TaskTool) *ReadOnlyTaskTool {
 func (*ReadOnlyTaskTool) Name() string { return "read_only_task" }
 
 func (*ReadOnlyTaskTool) Description() string {
-	return "Spawn a read-only research sub-agent for a focused investigation. The sub-agent runs in an isolated, ephemeral session with read-only tools only; bash is wrapped to allow only plan-mode safe foreground commands. It cannot write files, install capabilities, mutate memory, run background jobs, continue/fork transcripts, or delegate to writer-capable agents. Read-only nested delegation may be available until max_subagent_depth is reached. Only its final answer is returned."
+	return "Spawn a read-only research sub-agent for a focused investigation. The sub-agent runs in an isolated, ephemeral session with read-only tools only; bash is wrapped to allow only permission-classified foreground read-only commands. It cannot write files, install capabilities, mutate memory, run background jobs, continue/fork transcripts, or delegate to writer-capable agents. Read-only nested delegation may be available until max_subagent_depth is reached. Only its final answer is returned."
 }
 
 func (*ReadOnlyTaskTool) Schema() json.RawMessage {
@@ -421,7 +421,7 @@ func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err != nil {
 		return "", fmt.Errorf("read-only sub-agent profile: %w", err)
 	}
-	answer, err := r.task.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth)
+	answer, err := r.task.runReadOnlySubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth)
 	if err != nil {
 		return "", err
 	}
@@ -682,6 +682,8 @@ func FilterRegistry(parent *tool.Registry, names []string, exclude ...string) *t
 	src := names
 	if len(src) == 0 {
 		src = parent.Names()
+	} else {
+		src = expandToolPatterns(parent, src)
 	}
 	for _, name := range src {
 		if ex[name] {
@@ -714,7 +716,7 @@ func PlannerToolRegistry(parent *tool.Registry) *tool.Registry {
 
 // ReadOnlySubagentToolRegistry returns the tool set exposed to read-only
 // sub-agents: read-only research tools plus a bash wrapper that enforces the
-// plan-mode safe command policy at execution time. Workflow/meta tools are
+// permission-layer read-only command policy at execution time. Workflow/meta tools are
 // excluded even when their Tool.ReadOnly contract is true.
 func ReadOnlySubagentToolRegistry(parent *tool.Registry, names []string) *tool.Registry {
 	return ReadOnlySubagentToolRegistryForDepth(parent, names, 1, 1)
@@ -744,6 +746,8 @@ func ReadOnlySubagentToolRegistryForDepth(parent *tool.Registry, names []string,
 	src := names
 	if len(src) == 0 {
 		src = parent.Names()
+	} else {
+		src = expandToolPatterns(parent, src)
 	}
 	for _, name := range src {
 		if ex[name] {
@@ -761,13 +765,40 @@ func ReadOnlySubagentToolRegistryForDepth(parent *tool.Registry, names []string,
 			continue
 		}
 		if u, ok := tl.(tool.PlanModeUntrustedReadOnly); ok && u.PlanModeUntrustedReadOnly() {
-			// An external tool's self-reported readOnlyHint isn't trusted for a
-			// read-only research sub-agent; exclude it like a writer.
 			continue
 		}
 		sub.Add(tl)
 	}
 	return sub
+}
+
+// expandToolPatterns resolves explicit wildcard allowlist entries from imported
+// agent profiles against the current registry. Expansion is deterministic and
+// session-local, so optional MCP tools only enter a child after connection.
+func expandToolPatterns(parent *tool.Registry, names []string) []string {
+	if parent == nil {
+		return nil
+	}
+	available := parent.Names()
+	seen := map[string]bool{}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if !strings.ContainsAny(name, "*?[") {
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+			continue
+		}
+		for _, candidate := range available {
+			matched, err := filepath.Match(name, candidate)
+			if err == nil && matched && !seen[candidate] {
+				seen[candidate] = true
+				out = append(out, candidate)
+			}
+		}
+	}
+	return out
 }
 
 // FilterReadOnlyRegistry builds a sub-registry containing only tools whose
@@ -816,6 +847,15 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 	opts.ClassifierTaskText = prompt
 	prompt = t.withWorkspaceContext(prompt)
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, opts, sink)
+}
+
+func (t *TaskTool) runReadOnlySubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth)
+	// Capture the pristine task before host framing is prepended: delivery
+	// intent classification must judge the task, not the wrapper.
+	opts.ClassifierTaskText = prompt
+	prompt = t.withWorkspaceContext(prompt)
+	return RunReadOnlySubAgentWithSession(ctx, prov, subReg, sess, prompt, opts, sink)
 }
 
 // subagentOptions is the single construction point for the run options every
@@ -946,13 +986,18 @@ func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *to
 	if strings.TrimSpace(opts.ClassifierTaskText) == "" {
 		opts.ClassifierTaskText = prompt
 	}
+	planWorkflow := PlanModeFromContext(ctx)
 	if opts.SubagentDepth > 0 && isFreshSubagentSession(sess) {
 		prompt = subagentStartContext + "\n\n" + prompt
+	}
+	if planWorkflow && !strings.Contains(prompt, planmode.Marker) {
+		prompt = planmode.Marker + "\n\n" + prompt
 	}
 	if kind := opts.RequireReviewReportKind; kind != "" {
 		prompt = prompt + "\n\n" + reviewReportTaskContract(kind)
 	}
 	sub := New(prov, reg, sess, opts, sink)
+	sub.SetPlanMode(planWorkflow)
 	if err := sub.Run(ctx, prompt); err != nil {
 		// Still merge any partial child evidence so parent gates see real writes.
 		mergeChildEvidence(ctx, sub)
@@ -988,6 +1033,63 @@ func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *to
 		return answer, nil
 	}
 	return "", fmt.Errorf("sub-agent finished without producing a final answer")
+}
+
+// readOnlyAgentConstruction is the single pairing every strictly read-only
+// loop shares: the permanent ReadOnlyExecution flag plus the final registry
+// filter. Batch children (RunReadOnlySubAgentWithSession) and the interactive
+// two-model planner (NewReadOnlyAgent) both build through it, so a missed call
+// site cannot set only half the boundary.
+func readOnlyAgentConstruction(reg *tool.Registry, opts Options) (*tool.Registry, Options) {
+	opts.ReadOnlyExecution = true
+	return strictReadOnlyExecutionRegistry(reg), opts
+}
+
+// NewReadOnlyAgent constructs a long-lived, strictly read-only agent (the
+// two-model planner) through the shared construction boundary.
+func NewReadOnlyAgent(prov provider.Provider, reg *tool.Registry, sess *Session, opts Options, sink event.Sink) *Agent {
+	reg, opts = readOnlyAgentConstruction(reg, opts)
+	return New(prov, reg, sess, opts, sink)
+}
+
+// RunReadOnlySubAgentWithSession is the construction boundary for every
+// strictly read-only child loop. Registry filtering limits the visible surface;
+// this permanent execution flag also re-checks targets resolved dynamically by
+// proxy tools such as use_capability.
+func RunReadOnlySubAgentWithSession(ctx context.Context, prov provider.Provider, reg *tool.Registry, sess *Session, prompt string, opts Options, sink event.Sink) (string, error) {
+	reg, opts = readOnlyAgentConstruction(reg, opts)
+	return RunSubAgentWithSession(ctx, prov, reg, sess, prompt, opts, sink)
+}
+
+// strictReadOnlyExecutionRegistry is the final construction-time filter shared
+// by every strict child. Callers still apply role-specific filtering (review,
+// planner, profile allowlists), while this layer guarantees that a missed call
+// site cannot expose writers, destructive MCP tools, untrusted readers, or an
+// untrusted host-starting target to the model.
+func strictReadOnlyExecutionRegistry(reg *tool.Registry) *tool.Registry {
+	filtered := tool.NewRegistry()
+	if reg == nil {
+		return filtered
+	}
+	for _, name := range reg.Names() {
+		target, ok := reg.Get(name)
+		if !ok || !target.ReadOnly() || planModeUntrustedReadOnly(target) || mcpDestructiveHint(target) {
+			continue
+		}
+		// An installed MCP reader needs a positive trust authority (receipts),
+		// not a server hint carried through the no-TrustManager compatibility
+		// path: strict children fail closed without a trust store.
+		if isInstalledMCPTool(target) {
+			if authority, ok := target.(tool.ReadOnlyExecutionTrustAuthority); !ok || !authority.ReadOnlyExecutionTrustAuthority() {
+				continue
+			}
+		}
+		if mutation, ok := target.(tool.ReadOnlyExecutionHostMutation); ok && mutation.ReadOnlyExecutionHostMutation() && !readOnlyExecutionAllowsTrustedMCPStartup(target) {
+			continue
+		}
+		filtered.Add(target)
+	}
+	return filtered
 }
 
 // latestAssistantAnswer walks the session backwards for the last assistant

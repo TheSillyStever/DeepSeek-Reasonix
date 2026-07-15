@@ -33,7 +33,6 @@ import (
 	"reasonix/internal/notify"
 	"reasonix/internal/provider"
 	"reasonix/internal/provider/openai"
-	"reasonix/internal/sandbox"
 	"reasonix/internal/serve"
 
 	tea "charm.land/bubbletea/v2"
@@ -48,12 +47,6 @@ var (
 
 // Run is the CLI entry point; it returns a process exit code.
 func Run(args []string, version string) int {
-	// This binary routes the hidden Windows sandbox helper subcommand below;
-	// registering that fact is what lets sandbox.Available() report true.
-	sandbox.RegisterHelperDispatch()
-	if len(args) > 0 && args[0] == sandbox.WindowsHelperCommand {
-		return sandbox.RunWindowsSandboxHelper(args[1:], os.Stdin, os.Stdout, os.Stderr)
-	}
 	// Pick the UI language up front so even pre-config paths (the first-run
 	// welcome banner) come through localized. Env-only first; if a config
 	// exists and pins a language, that wins.
@@ -76,12 +69,15 @@ func Run(args []string, version string) int {
 	if len(args) > 0 && isDefaultInteractiveFlag(cmd) {
 		cmd = ""
 	}
-	if shouldMigrateLegacyConfigForCLI(cmd) {
+	doctorRepair := isDoctorRepairCommand(args)
+	if shouldMigrateLegacyConfigForCLI(cmd) && !doctorRepair {
 		migrateLegacyConfigForCLI()
 	}
-	if cfg, err := config.Load(); err == nil {
-		if cfg.Language != "" {
-			i18n.DetectLanguage(cfg.Language)
+	if !doctorRepair {
+		if cfg, err := config.Load(); err == nil {
+			if cfg.Language != "" {
+				i18n.DetectLanguage(cfg.Language)
+			}
 		}
 	}
 
@@ -130,7 +126,9 @@ func Run(args []string, version string) int {
 		configureCLIThemeFromConfigForTTYOutput()
 		return subagentCommand(rest)
 	case "doctor":
-		configureCLIThemeFromConfigNoProbe()
+		if !doctorRepair {
+			configureCLIThemeFromConfigNoProbe()
+		}
 		return doctorCommand(rest, version)
 	case "review":
 		configureCLIThemeFromConfigNoProbe()
@@ -152,6 +150,10 @@ func Run(args []string, version string) int {
 		usage()
 		return 2
 	}
+}
+
+func isDoctorRepairCommand(args []string) bool {
+	return len(args) > 1 && args[0] == "doctor" && args[1] == "repair"
 }
 
 func isDefaultInteractiveFlag(arg string) bool {
@@ -240,6 +242,7 @@ func setupProfileWithOverrides(ctx context.Context, modelName string, maxStepsOv
 	return boot.Build(ctx, boot.Options{
 		Model:                modelName,
 		MaxSteps:             maxStepsOverride,
+		MaxStepsKey:          "--max-steps",
 		RequireKey:           requireKey,
 		Sink:                 sink,
 		TokenMode:            profile,
@@ -310,6 +313,7 @@ func setupQuietProfile(ctx context.Context, modelName string, maxStepsOverride i
 	return boot.Build(ctx, boot.Options{
 		Model:           modelName,
 		MaxSteps:        maxStepsOverride,
+		MaxStepsKey:     "--max-steps",
 		RequireKey:      requireKey,
 		Sink:            sink,
 		Stderr:          io.Discard,
@@ -405,7 +409,7 @@ func runAgent(args []string) int {
 	fs.SetInterspersed(true)
 	model := fs.String("model", "", "provider name (default: config default_model)")
 	profileFlag := fs.String("profile", "balanced", "runtime profile: economy | balanced | delivery")
-	maxSteps := fs.Int("max-steps", 0, "max tool-call rounds (0 = use config/default)")
+	maxSteps := fs.Int("max-steps", 0, "one-off max tool-call rounds (0 = automatic)")
 	showThinking := fs.Bool("show-thinking", false, "show thinking text instead of the collapsed thinking marker")
 	metricsPath := fs.String("metrics", "", "write a JSON token/cache/cost summary of the run to this path")
 	dir := fs.String("dir", "", "change to this directory first (project root); config, sandbox and file tools resolve from here")
@@ -655,7 +659,7 @@ func runServe(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	model := fs.String("model", "", "provider name (default: config default_model)")
 	profileFlag := fs.String("profile", "balanced", "runtime profile: economy | balanced | delivery")
-	maxSteps := fs.Int("max-steps", 0, "max tool-call rounds (0 = use config/default)")
+	maxSteps := fs.Int("max-steps", 0, "one-off max tool-call rounds (0 = automatic)")
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address")
 	resume := fs.String("resume", "", "resume a saved session file")
 	auth := fs.String("auth", "", "auth mode: none, token, or password (default: none)")
@@ -814,7 +818,7 @@ func chatREPL(args []string) int {
 	fs.SetInterspersed(true)
 	model := fs.String("model", "", "provider name (default: config default_model)")
 	profileFlag := fs.String("profile", "balanced", "runtime profile: economy | balanced | delivery")
-	maxSteps := fs.Int("max-steps", 0, "max tool-call rounds (0 = use config/default)")
+	maxSteps := fs.Int("max-steps", 0, "one-off max tool-call rounds (0 = automatic)")
 	cont := fs.Bool("continue", false, "resume the most recent saved session")
 	fs.BoolVar(cont, "c", false, "shorthand for --continue")
 	resume := fs.StringP("resume", "r", "", "resume by session ID/query, or open the picker when no value is given")
@@ -1002,8 +1006,8 @@ func chatREPL(args []string) int {
 	// task tool) keep their headless gate from setup — no UI to prompt through.
 	ctrl.EnableInteractiveApproval()
 	applyPermissionMode(ctrl, permissions)
-	// YOLO: skip every tool approval request for the session (deny rules still
-	// apply; ask questions and plan approvals still wait for the user).
+	// YOLO: skip ordinary tool approval requests for the session (deny rules and
+	// fresh reviews still apply; ask questions and plan approvals still wait).
 	if *yolo {
 		ctrl.SetAutoApproveTools(true)
 	}
@@ -1022,7 +1026,7 @@ func chatREPL(args []string) int {
 	// model (carrying the conversation). It must NOT touch the running model —
 	// runModelSubcommand performs the swap on the live copy. The same stable sink
 	// feeds the new controller, so events keep flowing to this TUI.
-	m.buildController = func(spec controllerBuildSpec, carry []provider.Message, resumePath string) (*control.Controller, error) {
+	m.buildController = func(spec controllerBuildSpec, carry []provider.Message, resumePath string, oldCtrl control.SessionAPI) (*control.Controller, error) {
 		effectiveOverrides := overrides
 		if spec.EffortOverride != nil {
 			effectiveOverrides.Effort = spec.EffortOverride
@@ -1037,7 +1041,10 @@ func chatREPL(args []string) int {
 		// Keep the carried conversation in its existing file so the switch doesn't
 		// orphan a duplicate (#2807).
 		path := agent.ContinueSessionPath(resumePath, c.SessionDir(), c.Label())
-		c.AdoptHistory(carry, path)
+		if err := adoptCarriedHistoryPreservingProfileAndGrants(c, carry, path, oldCtrl); err != nil {
+			c.Close()
+			return nil, err
+		}
 		c.EnableInteractiveApproval()
 		c.SetPlanMode(spec.PlanMode)
 		if spec.ToolApprovalMode != "" {
@@ -1104,6 +1111,39 @@ func chatREPL(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// adoptCarriedHistoryPreservingProfileAndGrants resumes c on the carried
+// conversation the way buildController's callers expect: the freshly built
+// c already has its own leading system message for the target profile (see
+// boot/token_profile.go), but AdoptHistory below would otherwise replace the
+// whole history — including that message — with carry's outgoing one, so the
+// switch splices the new leading message in first. It also carries forward
+// oldCtrl's same-session "Allow for this session" tool grants and Plan-mode
+// read-only command trust, which a rebuild would otherwise silently drop,
+// forcing the user to re-approve things already granted this session.
+func adoptCarriedHistoryPreservingProfileAndGrants(c *control.Controller, carry []provider.Message, path string, oldCtrl control.SessionAPI) error {
+	if fresh := c.History(); len(fresh) > 0 && fresh[0].Role == provider.RoleSystem {
+		if len(carry) > 0 && carry[0].Role == provider.RoleSystem {
+			carry[0] = fresh[0]
+		} else {
+			carry = append([]provider.Message{fresh[0]}, carry...)
+		}
+	}
+	c.AdoptHistory(carry, path)
+	if prev, ok := oldCtrl.(*control.Controller); ok {
+		c.RestoreSessionAuthorizations(prev.SessionAuthorizations())
+	}
+	// Persist the adopted history now: the splice above only refreshed the new
+	// controller's memory and nothing saves again until the next turn ends, so
+	// quitting right after the switch and resuming would otherwise revive the
+	// outgoing profile's contract from disk.
+	if path != "" {
+		if err := c.Snapshot(); err != nil {
+			return fmt.Errorf("snapshot after runtime switch: %w", err)
+		}
+	}
+	return nil
 }
 
 func prepareNativeScrollback(w io.Writer, rows int) {

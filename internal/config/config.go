@@ -1,6 +1,5 @@
 // Package config loads Reasonix's runtime configuration from TOML. Resolution order:
 // flag > project ./reasonix.toml > user config.toml (in the OS user-config dir) > built-in defaults.
-// User-global runtime controls, such as agent step limits, are documented exceptions.
 // Secrets come from the environment via api_key_env and are never stored in
 // config files.
 package config
@@ -65,9 +64,26 @@ type Config struct {
 	providerSources            map[string]providerSourceScope
 	shadowedProjectProviders   []ProviderEntry
 	ignoredProjectDefaultModel string
+	ignoredLegacyStepLimits    bool
 	expansionEnv               map[string]string
 	pluginPackageOwners        map[string]string
 	pluginPackageSkillOwners   map[string][]string
+	pluginPackageAgentOwners   map[string][]string
+	safeMode                   bool
+}
+
+// SafeMode reports whether this configuration was built for recovery startup.
+// It is process-local runtime state and is never persisted to TOML.
+func (c *Config) SafeMode() bool {
+	return c != nil && c.safeMode
+}
+
+// IgnoredLegacyAgentStepLimits reports whether this load found and ignored the
+// retired [agent].max_steps or planner_max_steps settings. Boot removes standard
+// key assignments before loading, while read-only/config-only loads only report
+// and normalize them in memory.
+func (c *Config) IgnoredLegacyAgentStepLimits() bool {
+	return c != nil && c.ignoredLegacyStepLimits
 }
 
 // IgnoredProjectDefaultModel returns the project reasonix.toml default_model
@@ -1003,10 +1019,9 @@ func (c *Config) BashMode() string {
 }
 
 // BashModeForGOOS normalises the bash-sandbox mode for tests and cross-platform
-// rendering. Windows currently forces bash sandboxing off, even when older
-// configs explicitly requested "enforce", because the native backend still
-// breaks common Git Bash/MSYS2, Docker, and git workflows. macOS/Linux keep the
-// existing explicit-mode behavior.
+// rendering. Windows has no OS-level Bash sandbox and forces the effective mode
+// off, even when older configs explicitly requested "enforce". macOS/Linux keep
+// the existing explicit-mode behavior.
 func (c *Config) BashModeForGOOS(goos string) string {
 	if goos == "windows" {
 		return "off"
@@ -1029,10 +1044,13 @@ func (c *Config) BashModeForGOOS(goos string) string {
 // each model's prompt prefix stays cache-stable). SubagentModel is the optional
 // default for runAs=subagent skills; SubagentModels overrides it per skill name.
 type AgentConfig struct {
-	SystemPrompt        string            `toml:"system_prompt"`
-	SystemPromptFile    string            `toml:"system_prompt_file"`
-	MaxSteps            int               `toml:"max_steps"`         // tool-call rounds per turn; 0 = unlimited
-	PlannerMaxSteps     int               `toml:"planner_max_steps"` // planner read-only tool-call rounds; 0 = unlimited
+	SystemPrompt     string `toml:"system_prompt"`
+	SystemPromptFile string `toml:"system_prompt_file"`
+	// Deprecated compatibility fields. Old TOML and desktop clients may still
+	// send them, but config loading normalizes both to zero and rendering omits
+	// them. One-off CLI and unattended bot limits remain separate controls.
+	MaxSteps            int               `toml:"max_steps"`
+	PlannerMaxSteps     int               `toml:"planner_max_steps"`
 	Temperature         float64           `toml:"temperature"`
 	PlannerModel        string            `toml:"planner_model"`
 	GuardianModel       string            `toml:"guardian_model"`
@@ -1070,12 +1088,12 @@ type AgentConfig struct {
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
-	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
-	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
+	// PlanModeAllowedTools is a legacy compatibility field. Concrete MCP names may
+	// still become local read-only trust aliases, but this field does not control
+	// main Plan workflow availability.
 	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
-	// PlanModeReadOnlyCommands names concrete shell command prefixes that plan mode
-	// may treat as read-only. Shell operators, background execution, and shell
-	// interpreter prefixes remain blocked.
+	// PlanModeReadOnlyCommands is retained for old config/session round trips. Main
+	// Plan bash calls now use the ordinary Permissions classifier and Sandbox.
 	PlanModeReadOnlyCommands []string `toml:"plan_mode_read_only_commands"`
 	// MemoryCompiler controls the v5 execution-memory compiler. Missing configs
 	// default to enabled so users get the self-improving planner unless they opt
@@ -1459,6 +1477,12 @@ type PermissionsConfig struct {
 	Deny  []string `toml:"deny"`
 }
 
+// MCPToolPolicy is local execution policy for one raw server tool name. It is
+// intentionally absent from provider-visible tool schemas.
+type MCPToolPolicy struct {
+	ApprovalMode string `toml:"approval_mode" json:"approval_mode"`
+}
+
 // PluginEntry declares an external MCP server. Type selects the transport:
 // "stdio" (default) launches Command/Args/Env as a subprocess; "http"
 // (a.k.a. streamable-http) and "sse" connect to a remote URL with optional
@@ -1481,10 +1505,16 @@ type PluginEntry struct {
 	// from this server. Keys are server-local tool names, not model-visible
 	// mcp__server__tool names.
 	ToolTimeoutSeconds map[string]int `toml:"tool_timeout_seconds"`
-	// TrustedReadOnlyTools names raw MCP tool names that Reasonix should treat as
-	// trusted read-only for planner / plan-mode / read-only research surfaces.
-	// Use this only for tools whose semantics are known to be side-effect free.
+	// TrustedReadOnlyTools is a local trust and compatibility override for
+	// audited readers. Third-party readOnlyHint alone is not a Plan-mode trust
+	// boundary.
 	TrustedReadOnlyTools []string `toml:"trusted_read_only_tools"`
+	// DefaultToolsApprovalMode is auto|prompt|writes|approve. Empty is auto.
+	DefaultToolsApprovalMode string `toml:"default_tools_approval_mode"`
+	// Tools overrides approval policy by raw server-local tool name.
+	Tools map[string]MCPToolPolicy `toml:"tools"`
+	// ApprovalsReviewer is user|auto_review. Empty preserves legacy routing.
+	ApprovalsReviewer string `toml:"approvals_reviewer"`
 	// AutoStart controls whether the server connects during session startup.
 	// Nil preserves historical behavior: configured servers start automatically.
 	AutoStart *bool `toml:"auto_start"`
@@ -1569,10 +1599,8 @@ func Default() *Config {
 		},
 		Agent: AgentConfig{
 			SystemPrompt: DefaultSystemPrompt,
-			// 0 = no step cap: the agent loops until the model gives a final answer,
-			// the user cancels, or the provider errors. Context stays bounded by
-			// compaction, not by a round count. Set a positive agent.max_steps only
-			// if you want a hard guard against runaway.
+			// Normal interactive execution has no configurable total round cap. It
+			// is bounded by adaptive progress guards and context compaction instead.
 			MaxSteps:            0,
 			PlannerMaxSteps:     0,
 			AutoPlan:            "off",
@@ -1587,7 +1615,7 @@ func Default() *Config {
 		// deny/allow rules to harden or quiet specific tools.
 		Permissions: PermissionsConfig{Mode: "ask"},
 		// Sandbox uses platform defaults: macOS/Linux jail bash by default;
-		// Windows forces bash off until the native sandbox backend is reliable.
+		// Windows has no OS-level Bash sandbox and always forces bash off.
 		// Network=true here so an absent [sandbox] in a user's file keeps egress
 		// (zero value would wrongly deny it).
 		Sandbox: SandboxConfig{Network: true},

@@ -94,7 +94,7 @@ type chatTUI struct {
 	// Persists across turns until the work completes or a new session starts.
 	todoArgs string
 
-	// planMode mirrors the agent's read-only gate (Shift+Tab toggles it). The
+	// planMode mirrors the agent's plan-first workflow (Shift+Tab toggles it). The
 	// marker rides in outgoing user messages so the cache-stable prompt prefix is
 	// left untouched.
 	planMode bool
@@ -292,8 +292,11 @@ type chatTUI struct {
 	// model — the swap happens on the running copy). nil disables runtime
 	// rebuild commands. modelRef is the active "provider/model" ref, marked
 	// current in the picker. runtimeProfile stores boot's normalized token mode:
-	// full (displayed as balanced), economy, or delivery.
-	buildController func(spec controllerBuildSpec, carry []provider.Message, resumePath string) (*control.Controller, error)
+	// full (displayed as balanced), economy, or delivery. oldCtrl is the
+	// outgoing controller, passed through so the replacement can carry forward
+	// same-session tool grants and Plan-mode read-only command trust that
+	// don't travel through carry/resumePath (see Controller.RestoreSessionAuthorizations).
+	buildController func(spec controllerBuildSpec, carry []provider.Message, resumePath string, oldCtrl control.SessionAPI) (*control.Controller, error)
 	modelRef        string
 	runtimeProfile  string
 	effortLevel     string // "" when the current provider/model has no configurable effort
@@ -2450,12 +2453,13 @@ func approvalChoices(a *event.Approval) []approvalChoice {
 		return nil
 	}
 	var decisions []approvalChoice
+	fresh := a.Fresh || control.RequiresFreshHumanApprovalTool(a.Tool)
 	switch {
 	case a.Tool == planApprovalTool:
 		decisions = []approvalChoice{{allow: true}, {}}
-	case control.RequiresFreshHumanApprovalTool(a.Tool) && freshApprovalAllowsSession(a.Tool):
+	case fresh && freshApprovalAllowsSession(a.Tool):
 		decisions = []approvalChoice{{allow: true}, {allow: true, allowForSession: true}, {}}
-	case control.RequiresFreshHumanApprovalTool(a.Tool):
+	case fresh:
 		decisions = []approvalChoice{{allow: true}, {}}
 	default:
 		decisions = []approvalChoice{
@@ -2476,9 +2480,10 @@ func approvalChoices(a *event.Approval) []approvalChoice {
 
 func approvalChoiceLabels(a *event.Approval) []string {
 	choices := i18n.M.FreshHumanApprovalChoices
+	fresh := a.Fresh || control.RequiresFreshHumanApprovalTool(a.Tool)
 	if a.Tool == planApprovalTool {
 		choices = i18n.M.FreshHumanApprovalChoices
-	} else if !control.RequiresFreshHumanApprovalTool(a.Tool) {
+	} else if !fresh {
 		exactSessionRule := permission.SessionGrantRuleForScope(a.Tool, a.Subject)
 		exactPersistentRule := permission.RememberRuleForScope(a.Tool, a.Subject)
 		choices = fmt.Sprintf(i18n.M.ToolApprovalChoices, exactSessionRule, exactPersistentRule)
@@ -2492,7 +2497,7 @@ func approvalChoiceLabels(a *event.Approval) []string {
 	if a.Tool == agent.PlanModeReadOnlyCommandApprovalTool {
 		choices = i18n.M.PlanModeReadOnlyCommandChoices
 	}
-	if !control.RequiresFreshHumanApprovalTool(a.Tool) && a.Tool == "bash" && permission.BashCommandPrefix(a.Subject) != "" {
+	if !fresh && a.Tool == "bash" && permission.BashCommandPrefix(a.Subject) != "" {
 		prefixRule := permission.RememberRuleForScope(a.Tool, a.Subject)
 		choices = fmt.Sprintf(i18n.M.BashPrefixChoices, prefixRule, prefixRule)
 	}
@@ -3576,8 +3581,9 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 
 	case event.ToolDispatch:
 		// The early (partial) dispatch only carries the name — the full dispatch
-		// with args prints the line. The running spinner covers the gap meanwhile.
-		if e.Tool.Partial {
+		// with args prints the line. Same-ID preview refreshes are ignored because
+		// native scrollback cannot replace an already-printed diff card.
+		if e.Tool.Partial || e.Tool.Refreshed {
 			break
 		}
 		m.finalizeStreamed()
