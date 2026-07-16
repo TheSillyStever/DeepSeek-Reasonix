@@ -53,6 +53,7 @@ import (
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
 	"reasonix/internal/tool/sessiontool"
+	"reasonix/internal/workspacelease"
 )
 
 // ErrUnknownModel is returned by Build when the configured model can't be
@@ -177,9 +178,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	var migErr error
 	var stepLimitsMigrated bool
 	var stepLimitMigErr error
+	var redactToolOutputMigrated bool
+	var redactToolOutputMigErr error
 	if !config.SafeModeRequested() {
 		migrated, migErr = config.MigrateLegacyIfNeededForRoot(root)
 		stepLimitsMigrated, stepLimitMigErr = config.MigrateLegacyAgentStepLimitsForRoot(root)
+		redactToolOutputMigrated, redactToolOutputMigErr = config.MigrateLegacyRedactToolOutputForRoot(root)
 	}
 	cfg, err := config.LoadForRoot(root)
 	if err != nil {
@@ -189,9 +193,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// section before any tool, hook, or plugin subprocess can spawn. Package
 	// globals are correct here because [secrets] is user-global (project
 	// reasonix.toml cannot override it), so concurrent workspaces agree.
-	secrets.SetRedactToolOutput(cfg.SecretsRedactToolOutput())
 	secrets.SetFilterSubprocessEnv(cfg.Secrets.FilterSubprocessEnv)
 	secrets.SetProtectSensitiveFiles(cfg.Secrets.ProtectSensitiveFiles)
+	secrets.RegisterCredentialEnvKeys(cfg.CredentialEnvNames())
 	modelName := opts.Model
 	if modelName == "" {
 		modelName = cfg.DefaultModel
@@ -254,6 +258,17 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	} else if stepLimitMigErr != nil {
 		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "Deprecated agent step-limit migration did not complete.", Detail: stepLimitMigErr.Error()})
 	}
+	if redactToolOutputMigrated || redactToolOutputMigErr != nil {
+		level := event.LevelInfo
+		text := "Deprecated redact_tool_output setting was removed."
+		detail := "[secrets].redact_tool_output no longer has any effect: ordinary model/tool content and local session/job artifacts now preserve their original text. Explicit diagnostics and reasonix doctor redact-sessions still redact credential values."
+		if redactToolOutputMigErr != nil {
+			level = event.LevelWarn
+			text = "Deprecated redact_tool_output setting was ignored."
+			detail += " The old key could not be removed: " + redactToolOutputMigErr.Error()
+		}
+		sink.Emit(event.Event{Kind: event.Notice, Level: level, Text: text, Detail: detail})
+	}
 	// Safe Mode is a recovery boundary: it must not rewrite memory or session
 	// state that a crash may have corrupted, so the legacy-store imports run
 	// only on normal boots (matching the config migration gate above).
@@ -271,7 +286,24 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if !opts.RequireKey && entry.RequiresAPIKey() && entry.APIKey() == "" {
 		sink.Emit(event.Event{Kind: event.Notice, Text: "Selected model is missing its API key.", Detail: fmt.Sprintf("model %q is selected but its API key %s is not set — requests will fail until you set it", modelName, entry.APIKeyEnv)})
 	}
-	jm := jobs.NewManager(sink, jobs.WithStalledWarningAfter(time.Duration(cfg.BackgroundJobStalledWarningSeconds())*time.Second))
+	var workspaceLease *workspacelease.Owner
+	jobOptions := []jobs.Option{jobs.WithStalledWarningAfter(time.Duration(cfg.BackgroundJobStalledWarningSeconds()) * time.Second)}
+	if tokenDelivery {
+		workspaceLease, err = workspacelease.New(root, config.WorkspaceLeaseDir(), func() {
+			sink.Emit(event.Event{
+				Kind:   event.Notice,
+				Level:  event.LevelInfo,
+				Code:   event.NoticeCodeWorkspaceLease,
+				Text:   "Another Delivery session is writing to this workspace; this session will continue automatically when it is safe.",
+				Detail: "workspace write lease is busy; read-only work remains concurrent",
+			})
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize Delivery workspace lease: %w", err)
+		}
+		jobOptions = append(jobOptions, jobs.WithJobStartObserver(workspaceLease.RetainUntil))
+	}
+	jm := jobs.NewManager(sink, jobOptions...)
 	sessionDir := opts.SessionDir
 	if sessionDir == "" {
 		sessionDir = config.SessionDir()
@@ -391,7 +423,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	reg := tool.NewRegistry()
 	writeRoots := cfg.WriteRootsForRoot(root)
 	writeRoots = appendUniquePaths(writeRoots, additionalDirs...)
-	forbidReadRoots := cfg.ForbidReadRootsForRoot(root)
+	forbidReadRoots := RuntimeForbidReadRoots(cfg, root)
 	// managedConfig names the Reasonix-owned config FILES (config.toml,
 	// compatibility TOMLs, legacy v0.x config.json) the file-writers may repair
 	// outside the workspace after a fresh per-write human approval. The bash
@@ -738,7 +770,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
 			WithTranscriptIdentityResolver(subagentIdentity).
 			WithMaxSubagentDepth(maxSubagentDepth).
-			WithDeliveryProfile(tokenDelivery)
+			WithDeliveryProfile(tokenDelivery).
+			WithWorkspaceLease(workspaceLease)
 	}
 	addTaskTool := func() string {
 		if taskToolAdded {
@@ -834,6 +867,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			SubagentDepth:       childDepth,
 			MaxSubagentDepth:    maxSubagentDepth,
 			DeliveryProfile:     tokenDelivery,
+			WorkspaceLease:      workspaceLease,
 		}
 	}
 	readOnlySkillRunner := func(sctx context.Context, sk skill.Skill, task string, runOpts skill.SubagentRunOptions) (string, error) {
@@ -1354,6 +1388,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Jobs:                               jm,
 		ProjectChecks:                      projectChecks,
 		DeliveryProfile:                    tokenDelivery,
+		WorkspaceLease:                     workspaceLease,
 		CapabilityLedger:                   capLedger,
 		CapabilityAudit:                    capAudit,
 		ContextWindow:                      entry.ContextWindow,
@@ -1841,6 +1876,36 @@ func appendUniquePaths(base []string, extra ...string) []string {
 		out = append(out, path)
 	}
 	return out
+}
+
+// RuntimeForbidReadRoots returns the configured deny roots plus Reasonix's
+// global credential FILE when it exists. It also registers the corresponding
+// credential environment names for subprocess filtering. Runtime tool
+// assemblers outside Build must use this helper instead of reading the config
+// roots directly.
+//
+// Provider and bot credentials are loaded into the parent process from this
+// file, so readers, shell commands, and MCP servers must not be able to recover
+// them even when the optional broad sensitive-file denylist is off. Project
+// .env files retain their existing behavior.
+func RuntimeForbidReadRoots(cfg *config.Config, root string) []string {
+	if cfg == nil {
+		return nil
+	}
+	secrets.RegisterCredentialEnvKeys(cfg.CredentialEnvNames())
+	base := cfg.ForbidReadRootsForRoot(root)
+	credentialPath := strings.TrimSpace(config.UserCredentialsPath())
+	if credentialPath == "" {
+		return append([]string(nil), base...)
+	}
+	info, err := os.Stat(credentialPath)
+	if err != nil || info.IsDir() {
+		return append([]string(nil), base...)
+	}
+	if real, err := filepath.EvalSymlinks(credentialPath); err == nil {
+		credentialPath = real
+	}
+	return appendUniquePaths(base, credentialPath)
 }
 
 func pathComparisonKey(path string) string {

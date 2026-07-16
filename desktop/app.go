@@ -41,6 +41,7 @@ import (
 	"reasonix/internal/fileref"
 	fileenc "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/i18n"
+	"reasonix/internal/jobs"
 	"reasonix/internal/mcpcatalog"
 	"reasonix/internal/mcpdiag"
 	"reasonix/internal/mcptrust"
@@ -1037,6 +1038,17 @@ func (a *App) SubmitDisplayToTab(tabID, display, input string) error {
 	}
 	a.ensureTabTopicIndexedForUserTurn(tab)
 	ctrl.SubmitDisplay(display, input)
+	a.finishTabTurnStart(tab, ctrl)
+	return nil
+}
+
+func (a *App) SubmitDeliveryRecoveryToTab(tabID, display, input string) error {
+	tab, ctrl, err := a.beginTabTurn(tabID, true)
+	if err != nil {
+		return err
+	}
+	a.ensureTabTopicIndexedForUserTurn(tab)
+	ctrl.SubmitDeliveryRecovery(display, input)
 	a.finishTabTurnStart(tab, ctrl)
 	return nil
 }
@@ -2842,12 +2854,22 @@ func (a *App) destroyHandlesForSession(dir, sessionPath string, removed []remove
 }
 
 func waitDestroyHandles(destroys []control.SessionDestroyHandle) bool {
-	timedOut := false
+	results := make(chan jobs.TeardownResult, len(destroys))
+	waits := 0
 	for _, destroy := range destroys {
-		if destroy.Wait != nil {
-			if destroy.Wait().HasTimedOut() {
-				timedOut = true
-			}
+		if destroy.Wait == nil {
+			continue
+		}
+		waits++
+		go func(wait func() jobs.TeardownResult) {
+			results <- wait()
+		}(destroy.Wait)
+	}
+
+	timedOut := false
+	for range waits {
+		if (<-results).HasTimedOut() {
+			timedOut = true
 		}
 	}
 	return timedOut
@@ -3870,6 +3892,7 @@ func promptHistoryFallbackMillis(path string, info os.FileInfo) int64 {
 
 func promptHistoryEventMillis(rec previewEventRecord) (int64, bool) {
 	for _, raw := range []json.RawMessage{
+		rec.TS,
 		rec.Time,
 		rec.Timestamp,
 		rec.CreatedAt,
@@ -4290,6 +4313,7 @@ type HistoryMessage struct {
 	Code               string                    `json:"code,omitempty"`
 	SubmitText         string                    `json:"submitText,omitempty"`
 	CheckpointTurn     *int                      `json:"checkpointTurn,omitempty"`
+	CreatedAt          int64                     `json:"createdAt,omitempty"`
 	Reasoning          string                    `json:"reasoning,omitempty"`
 	MemoryCitations    []provider.MemoryCitation `json:"memoryCitations,omitempty"`
 	WorkDurationMs     int64                     `json:"workDurationMs,omitempty"`
@@ -4331,6 +4355,46 @@ type HistoryPage struct {
 	HasOlder   bool             `json:"hasOlder"`
 }
 
+// historyProviderMessagesWithPersistedTimes overlays legacy event-record
+// timestamps onto a copy for display. It deliberately leaves the controller's
+// provider transcript untouched: timestamp migration must not change session
+// digests, conflict detection, or model-request cache prefixes.
+func historyProviderMessagesWithPersistedTimes(msgs []provider.Message, sessionPath string) []provider.Message {
+	if len(msgs) == 0 || strings.TrimSpace(sessionPath) == "" {
+		return msgs
+	}
+	needsPersistedTime := false
+	for _, msg := range msgs {
+		if msg.Role == provider.RoleUser && msg.CreatedAt <= 0 && agent.IsUserAuthoredTurn(msg.Content) {
+			needsPersistedTime = true
+			break
+		}
+	}
+	if !needsPersistedTime {
+		return msgs
+	}
+	users, err := agent.LoadSessionUserMessages(sessionPath)
+	if err != nil || len(users) == 0 {
+		return msgs
+	}
+	out := append([]provider.Message(nil), msgs...)
+	userIndex := 0
+	for i := range out {
+		if out[i].Role != provider.RoleUser {
+			continue
+		}
+		if userIndex >= len(users) {
+			break
+		}
+		user := users[userIndex]
+		userIndex++
+		if out[i].CreatedAt <= 0 && !user.At.IsZero() {
+			out[i].CreatedAt = user.At.UnixMilli()
+		}
+	}
+	return out
+}
+
 // History returns the session's message log.
 func (a *App) History() []HistoryMessage {
 	return a.HistoryForTab("")
@@ -4361,9 +4425,9 @@ func (a *App) HistoryPageForTab(tabID string, beforeTurn, limit int) HistoryPage
 		}
 		return page
 	}
-	msgs := ctrl.History()
 	dir := controllerSessionDir(ctrl)
 	path := ctrl.SessionPath()
+	msgs := historyProviderMessagesWithPersistedTimes(ctrl.History(), path)
 	return historyPageFromProviderMessages(
 		msgs,
 		sessionDisplayResolver(dir, path),
@@ -4454,9 +4518,9 @@ func (a *App) HistoryForTab(tabID string) []HistoryMessage {
 		}
 		return messages
 	}
-	msgs := ctrl.History()
 	dir := controllerSessionDir(ctrl)
 	path := ctrl.SessionPath()
+	msgs := historyProviderMessagesWithPersistedTimes(ctrl.History(), path)
 	return historyMessagesWithPlannerDisplays(
 		msgs,
 		sessionDisplayResolver(dir, path),
@@ -4551,7 +4615,7 @@ func historyMessagesWithPlannerDisplaysAndLookups(
 		if m.Role == provider.RoleAssistant {
 			reasoning = m.ReasoningContent
 		}
-		hm := HistoryMessage{Role: string(m.Role), Content: content, CheckpointTurn: checkpointTurn, Reasoning: reasoning, WorkDurationMs: m.WorkDurationMs}
+		hm := HistoryMessage{Role: string(m.Role), Content: content, CheckpointTurn: checkpointTurn, CreatedAt: m.CreatedAt, Reasoning: reasoning, WorkDurationMs: m.WorkDurationMs}
 		if m.Role == provider.RoleAssistant && len(m.MemoryCitations) > 0 {
 			hm.MemoryCitations = append([]provider.MemoryCitation(nil), m.MemoryCitations...)
 		}
@@ -5005,7 +5069,7 @@ func previewSessionMessages(sessionDir, path string) ([]HistoryMessage, error) {
 		return nil, err
 	}
 	return historyMessagesWithPlannerDisplays(
-		loaded.Snapshot(),
+		historyProviderMessagesWithPersistedTimes(loaded.Snapshot(), sessionPath),
 		sessionDisplayResolver(sessionDir, sessionPath),
 		sessionPlannerDisplayTurns(sessionDir, sessionPath),
 		nil,
@@ -5028,7 +5092,7 @@ func previewSessionPage(sessionDir, path string, beforeTurn, limit int) (History
 		return HistoryPage{}, err
 	}
 	return historyPageFromProviderMessages(
-		loaded.Snapshot(),
+		historyProviderMessagesWithPersistedTimes(loaded.Snapshot(), sessionPath),
 		sessionDisplayResolver(sessionDir, sessionPath),
 		sessionPlannerDisplayTurns(sessionDir, sessionPath),
 		nil,
@@ -5041,6 +5105,7 @@ type previewEventRecord struct {
 	Kind             string                    `json:"kind"`
 	Type             string                    `json:"type"`
 	Role             string                    `json:"role"`
+	TS               json.RawMessage           `json:"ts"`
 	Time             json.RawMessage           `json:"time"`
 	Timestamp        json.RawMessage           `json:"timestamp"`
 	CreatedAt        json.RawMessage           `json:"createdAt"`
@@ -5118,7 +5183,11 @@ func previewEventSessionMessages(path string) ([]HistoryMessage, bool, error) {
 		switch eventName {
 		case "user.message":
 			if rec.Text != "" {
-				out = append(out, HistoryMessage{Role: "user", Content: rec.Text})
+				hm := HistoryMessage{Role: "user", Content: rec.Text}
+				if at, ok := promptHistoryEventMillis(rec); ok {
+					hm.CreatedAt = at
+				}
+				out = append(out, hm)
 			}
 		case "model.final":
 			hm := HistoryMessage{Role: "assistant", Content: rec.Content, Reasoning: firstNonEmpty(rec.Reasoning, rec.ReasoningContent)}
@@ -6319,7 +6388,7 @@ func (a *App) mcpTrustSpec(name string) (plugin.Spec, error) {
 		DefaultCallTimeout: time.Duration(cfg.MCPCallTimeoutSeconds()) * time.Second,
 		TrustManager:       mcptrust.ForWorkspace(config.ReasonixHomeDir(), root),
 		ConfigSource:       "workspace_config", StateHome: config.ReasonixHomeDir(),
-		WriterRoots: cfg.WriteRootsForRoot(root), ForbidReadRoots: cfg.ForbidReadRootsForRoot(root),
+		WriterRoots: cfg.WriteRootsForRoot(root), ForbidReadRoots: boot.RuntimeForbidReadRoots(cfg, root),
 		Network:         cfg.Sandbox.Network,
 		OfficialServers: boot.LoadOfficialMCPTrust(context.Background(), cfg),
 	})

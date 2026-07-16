@@ -178,6 +178,31 @@ func credentialEnvNamesFromConfig(cfg *Config) []string {
 	return out
 }
 
+// CredentialEnvNames returns every environment-variable name whose value can
+// be loaded from Reasonix's global credential store. This includes configured
+// provider/bot keys and stored keys that are no longer referenced by the
+// current config: loadCredentialStoreForRoot loads the whole credential file,
+// so stale entries must remain outside child-process environments too.
+func (c *Config) CredentialEnvNames() []string {
+	names := credentialEnvNamesFromConfig(c)
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		seen[name] = true
+	}
+	if file, ok := readDotEnvFile(UserCredentialsPath()); ok {
+		for name := range file.Values {
+			name = strings.TrimSpace(name)
+			if !isCredentialKey(name) || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func resolveProviderCredentialsForRoot(root string, cfg *Config) {
 	if cfg == nil || len(cfg.Providers) == 0 {
 		return

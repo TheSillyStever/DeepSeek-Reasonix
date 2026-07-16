@@ -23,7 +23,6 @@ import {
   FileText,
   FileJson,
   GitBranch,
-  History,
   MessageSquare,
   Settings as SettingsIcon,
   Pencil,
@@ -39,7 +38,7 @@ import { useWailsResizeFix } from "./lib/useWailsResizeFix";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT, type Translator } from "./lib/i18n";
 import { localizedNoticeText, useController, type Item, type LiveStream } from "./lib/useController";
-import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered } from "./lib/bridge";
+import { app, onEvent, onProjectTreeChanged, onReady, onRuntimeRebuilt, onSessionRecovered, openExternal } from "./lib/bridge";
 import { generativeMusic, isGenerativeMusicEnabled } from "./lib/generative-music";
 import { clearAttentionChimeKeys, playAttentionChime, playSuccessChime, shouldPlayAttentionChimeForEvent } from "./lib/sound";
 import { NoticeCard, Transcript } from "./components/Transcript";
@@ -64,6 +63,7 @@ import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { AppChrome } from "./components/AppChrome";
 import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
+import { WorktreeBadge } from "./components/WorktreeBadge";
 import { HeartbeatPanel } from "./custom/features/heartbeat/HeartbeatPanel";
 import "./custom/features/heartbeat/heartbeat.css";
 import { CopyButton } from "./components/CopyButton";
@@ -146,6 +146,7 @@ import {
   saveRightDockPreviewWidth,
   saveRightDockTreeWidth,
   saveSidebarCollapsed,
+  saveWorkspacePanelOpen,
   saveSidebarWidth,
   useLayoutStore,
 } from "./store/layout";
@@ -374,6 +375,7 @@ type SidebarImConnection = {
 type DesktopNavigationInput =
   | { kind: "topic"; scope: string; workspaceRoot: string; topicId: string; sessionPath?: string }
   | { kind: "blank"; scope: string; workspaceRoot: string }
+  | { kind: "delivery-worktree"; workspaceRoot: string }
   | { kind: "sidebar-im"; connection: SidebarImConnection }
   | { kind: "resume-session"; session: SessionMeta };
 type PendingDesktopNavigationRequest = PendingNavigationRequest<DesktopNavigationInput>;
@@ -998,6 +1000,7 @@ export default function App() {
     state,
     activeTabId,
     sendToTab,
+    recoverDeliveryToTab,
     runShellForTab,
     steerForTab,
     notice,
@@ -1033,6 +1036,7 @@ export default function App() {
     setTokenMode,
     switchTab,
     openProjectTab,
+    createDeliveryWorktree,
     openGlobalTab,
     closeTab,
     reorderTabs,
@@ -2354,6 +2358,7 @@ export default function App() {
         return;
       }
       setWorkspacePanelOpen(true);
+      saveWorkspacePanelOpen(true);
     },
     [closeTransientOverlays, rightDockMode, workspacePanelMaximized, workspacePanelOpen],
   );
@@ -2366,6 +2371,7 @@ export default function App() {
     setLiveWorkspacePanelRenderWidth(null);
     setWorkspacePanelMaximized(false);
     setWorkspacePanelOpen(false);
+    saveWorkspacePanelOpen(false);
   }, [closeTransientOverlays, workspacePanelOpen]);
 
   const toggleWorkspacePanel = useCallback(() => {
@@ -2657,9 +2663,9 @@ export default function App() {
       goal: state.meta?.goal,
       activeTabId: () => activeTabIdRef.current,
       resumeGoal: resumeControllerGoalForTab,
-      send: (tabId) => commitThenSend(tabId, t("notice.deliveryIncompleteContinuePrompt")),
+      send: (tabId) => recoverDeliveryToTab(tabId, t("notice.deliveryIncompleteContinuePrompt")),
     });
-  }, [commitThenSend, controllerReady, resumeControllerGoalForTab, state.meta?.goal, t]);
+  }, [controllerReady, recoverDeliveryToTab, resumeControllerGoalForTab, state.meta?.goal, t]);
   commitThenSendRef.current = commitThenSend;
 
   const handleMessageAction = useCallback((turn: number, scope: string) => {
@@ -2780,17 +2786,6 @@ export default function App() {
     }
   }, [activeTab?.readOnly, activeTabId, clearContextPending, controllerReady, hydratePlaceholderActive, sendToTab, state.approval, state.ask, state.items, state.messageAction, state.running, rewindForTab]);
 
-  // History drawer: project menus can open a scoped saved-session list. Idle row
-  // clicks resume; running row clicks only preview through PreviewSession.
-  const openProjectHistory = useCallback(async (scope: "global" | "project", workspaceRoot: string) => {
-    closeTransientOverlays();
-    const filter = { scope, workspaceRoot };
-    setHistView({ kind: "history", source: "scope", filter, sessions: sessionsForScope(await listSessions(), filter) });
-  }, [closeTransientOverlays, listSessions]);
-  const openAllHistory = useCallback(async () => {
-    closeTransientOverlays();
-    setHistView({ kind: "history", source: "all", sessions: await listSessions() });
-  }, [closeTransientOverlays, listSessions]);
   const openTrash = useCallback(async () => {
     closeTransientOverlays();
     setHistView({ kind: "trash", sessions: await listTrashedSessions() });
@@ -2855,6 +2850,25 @@ export default function App() {
         return;
       }
 
+      if (request.kind === "delivery-worktree") {
+        const result = await createDeliveryWorktree(request.workspaceRoot);
+        if (!latest()) return;
+        seedActiveTabMeta(result.tab);
+        setProjectRevision((value) => value + 1);
+        await refreshLatestTabMetas();
+        if (!latest()) return;
+        showToast(
+          result.sourceDirty
+            ? t("projectTree.worktreeCreatedDirty", { branch: result.branch })
+            : t("projectTree.worktreeCreated", { branch: result.branch }),
+          result.sourceDirty ? "warn" : "info",
+          { durationMs: result.sourceDirty ? 7000 : 3500 },
+        );
+        setTabRevealSignal((signal) => signal + 1);
+        setTranscriptRevealSignal((signal) => signal + 1);
+        return;
+      }
+
       if (request.kind === "sidebar-im") {
         const { connection } = request;
         const target = sidebarImSessionTarget(connection);
@@ -2914,6 +2928,11 @@ export default function App() {
         void refreshLatestTabMetas();
         return;
       }
+      if (request.kind === "delivery-worktree") {
+        console.warn("isolated Delivery workspace creation failed", err);
+        showToast(err instanceof Error ? err.message : String(err), "error", { durationMs: 6000 });
+        return;
+      }
       if (request.kind === "sidebar-im") {
         console.warn("bot sidebar open failed", err);
         showToast(t("sidebar.imOpenFailed", { name: request.connection.title }));
@@ -2931,7 +2950,7 @@ export default function App() {
         showToast(err?.message || String(err));
       }
     }
-  }, [activateTopic, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
+  }, [activateTopic, createDeliveryWorktree, ensureBlankSurface, ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, openTopicSession, refreshHistoryView, resumeSession, seedActiveTabMeta, showToast, singleSurfaceLayout, t]);
 
   const enqueueNavigation = useCallback((input: DesktopNavigationInput): Promise<void> => enqueueNavigationRequest(
     { seqRef: navigationSeqRef, runningRef: navigationRunningRef, pendingRef: navigationPendingRef },
@@ -3025,7 +3044,6 @@ export default function App() {
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const cmds: PaletteItem[] = [
       { id: "cmd-new", group: t("palette.group.commands"), title: t("palette.cmd.newSession"), icon: <SquarePen size={15} />, compact: true, keywords: ["new", "新建"], run: () => void handleNewTab() },
-      { id: "cmd-history", group: t("palette.group.commands"), title: t("palette.cmd.history"), icon: <History size={15} />, compact: true, keywords: ["history", "历史"], run: () => void openAllHistory() },
       { id: "cmd-trash", group: t("palette.group.commands"), title: t("palette.cmd.trash"), icon: <Trash2 size={15} />, compact: true, keywords: ["trash", "回收站"], run: () => void openTrash() },
       { id: "cmd-settings", group: t("palette.group.commands"), title: t("palette.cmd.settings"), icon: <SettingsIcon size={15} />, compact: true, keywords: ["settings", "设置"], run: () => setSettingsTarget("general") },
       { id: "cmd-appearance", group: t("palette.group.commands"), title: t("palette.cmd.appearance"), icon: <Palette size={15} />, compact: true, keywords: ["theme", "appearance", "外观", "主题"], run: () => setSettingsTarget("appearance") },
@@ -3050,7 +3068,7 @@ export default function App() {
       run: () => void onResumeSession(s),
     }));
     return [...cmds, ...sessionItems];
-  }, [t, paletteSessions, handleNewTab, openAllHistory, openTrash, onResumeSession]);
+  }, [t, paletteSessions, handleNewTab, openTrash, onResumeSession]);
   // Delete / rename act on disk, then re-fetch so the panel reflects the change.
   const onDeleteSession = useCallback(
     async (path: string) => {
@@ -3419,8 +3437,8 @@ export default function App() {
               activeSessionPath={activeTab?.sessionPath}
               imTopicSources={imTopicSources}
               onOpenTopic={handleOpenTopic}
-              onOpenProjectHistory={openProjectHistory}
               onCreateTopic={(scope, workspaceRoot) => openBlankSession(scope, scope === "project" ? workspaceRoot : "")}
+              onCreateDeliveryWorktree={(workspaceRoot) => enqueueNavigation({ kind: "delivery-worktree", workspaceRoot })}
               onTopicsChanged={refreshProjectsAndTabs}
               onRenameTopic={renameTopic}
               refreshSignal={projectRevision}
@@ -3441,16 +3459,6 @@ export default function App() {
           {sidebarWorkbench ? (
             <nav className="sidebar__nav sidebar__nav--footer">
               <div className="sidebar__utility-row" aria-label={t("sidebar.utilityActions")}>
-                <Tooltip label={t("sidebar.allHistory")} fill side="top">
-                  <button
-                    className="sidebar__utility-button"
-                    type="button"
-                    onClick={() => void openAllHistory()}
-                  >
-                    <History size={16} aria-hidden="true" />
-                    <span className="sr-only">{t("sidebar.allHistory")}</span>
-                  </button>
-                </Tooltip>
                 <Tooltip label={t("sidebar.trash")} fill side="top">
                   <button
                     className="sidebar__utility-button"
@@ -3505,15 +3513,6 @@ export default function App() {
                   </button>
                 </Tooltip>
               )}
-              <Tooltip label={t("sidebar.allHistory")} fill side="right" disabled={sidebarNavTooltipDisabled}>
-                <button
-                  className="sidebar__navitem"
-                  onClick={() => void openAllHistory()}
-                >
-                  <History size={15} />
-                  <span>{t("sidebar.allHistory")}</span>
-                </button>
-              </Tooltip>
               <Tooltip label={t("sidebar.trash")} fill side="right" disabled={sidebarNavTooltipDisabled}>
                 <button
                   className="sidebar__navitem"
@@ -3652,6 +3651,7 @@ export default function App() {
               {topicbarSubtitleVisible && (
                 <div className="topicbar__subtitle" title={topicbarSubtitleTitle}>
                   {topicbarWorkspaceLabel && <span>{topicbarWorkspaceLabel}</span>}
+                  {activeTab?.isolatedWorktree && <WorktreeBadge size={11} />}
                   {topicbarImSourcePlatform && (
                     <span className={`topicbar__source-chip topicbar__source-chip--${topicbarImSourcePlatform}`}>
                       {topicbarImSourceLabel}
@@ -3801,7 +3801,13 @@ export default function App() {
             <div className="banner banner--warning">{t("guard.safeMode")}</div>
           )}
 
-          <UpdateBanner enabled={startupUpdateChecksEnabled === true} />
+          <UpdateBanner
+            enabled={startupUpdateChecksEnabled === true}
+            onShowReleaseNotes={(latest) => {
+              const version = latest.replace(/^(?:desktop-)?v/, "");
+              void openExternal(`https://reasonix.io/changelog/v${version}/`);
+            }}
+          />
 
           <main className="main">
             {sidebarImDetailConnection ? (

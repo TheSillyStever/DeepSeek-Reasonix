@@ -29,6 +29,7 @@ import (
 	"reasonix/internal/pluginpkg"
 	"reasonix/internal/provider"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/secrets"
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
 
@@ -3541,6 +3542,70 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 }
 
+func TestBuildMigratesDeprecatedRedactToolOutputWithOneNotice(t *testing.T) {
+	home := isolateConfigHome(t)
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+	project := robustTempDir(t)
+	configPath := filepath.Join(project, "reasonix.toml")
+	writeFile(t, project, "reasonix.toml", `
+default_model = "test-model"
+
+[secrets]
+redact_tool_output = true
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+
+	var notices []event.Event
+	sink := event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e)
+		}
+	})
+	build := func() {
+		t.Helper()
+		ctrl, err := Build(context.Background(), Options{Sink: sink, WorkspaceRoot: project})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		ctrl.Close()
+	}
+
+	build()
+	migrationNotices := 0
+	for _, notice := range notices {
+		if notice.Text == "Deprecated redact_tool_output setting was removed." {
+			migrationNotices++
+			if notice.Level != event.LevelInfo || !strings.Contains(notice.Detail, "doctor redact-sessions") {
+				t.Fatalf("migration notice = %+v", notice)
+			}
+		}
+	}
+	if migrationNotices != 1 {
+		t.Fatalf("migration notices = %d, want 1; got %+v", migrationNotices, notices)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "redact_tool_output") {
+		t.Fatalf("deprecated redact_tool_output remains after boot:\n%s", raw)
+	}
+
+	notices = nil
+	build()
+	for _, notice := range notices {
+		if strings.Contains(notice.Text, "redact_tool_output") {
+			t.Fatalf("second boot repeated migration notice: %+v", notice)
+		}
+	}
+}
+
 func TestBuildMigratesLegacySessionsFromConfigSessionDir(t *testing.T) {
 	home := robustTempDir(t)
 	t.Setenv("HOME", home)
@@ -4000,6 +4065,71 @@ func TestAppendUniquePathsDeduplicatesSymlinkEquivalentRoots(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{link}) {
 		t.Fatalf("roots = %v, want only original symlink root", got)
 	}
+}
+
+func TestRuntimeForbidReadRootsAddsOnlyGlobalCredentialFile(t *testing.T) {
+	home := isolateConfigHome(t)
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+	configured := filepath.Join(t.TempDir(), "configured-secret")
+	projectEnv := filepath.Join(t.TempDir(), ".env")
+	for _, path := range []string{configured, projectEnv} {
+		if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.Default()
+	cfg.Sandbox.ForbidRead = []string{configured}
+	withoutCredentials := RuntimeForbidReadRoots(cfg, ".")
+	if !reflect.DeepEqual(withoutCredentials, []string{configured}) {
+		t.Fatalf("roots without global credentials = %v", withoutCredentials)
+	}
+
+	credentialPath := config.UserCredentialsPath()
+	if err := os.MkdirAll(filepath.Dir(credentialPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialPath, []byte("PROVIDER_KEY=secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := RuntimeForbidReadRoots(cfg, ".")
+	if !pathListContains(got, credentialPath) || !pathListContains(got, configured) {
+		t.Fatalf("runtime forbid roots = %v", got)
+	}
+	if pathListContains(got, projectEnv) {
+		t.Fatalf("project .env was unexpectedly added to runtime forbid roots: %v", got)
+	}
+}
+
+func TestRuntimeForbidReadRootsFiltersUnconfiguredStoredCredential(t *testing.T) {
+	home := isolateConfigHome(t)
+	t.Setenv("REASONIX_HOME", filepath.Join(home, "reasonix-home"))
+	const staleKey = "REASONIX_TEST_UNCONFIGURED_STORED_CREDENTIAL"
+	t.Setenv(staleKey, "opaque-stale-value")
+
+	credentialPath := config.UserCredentialsPath()
+	if err := os.MkdirAll(filepath.Dir(credentialPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credentialPath, []byte(staleKey+"=opaque-stale-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = RuntimeForbidReadRoots(config.Default(), ".")
+	joined := strings.Join(secrets.ProcessEnv(), "\n")
+	if strings.Contains(joined, staleKey+"=") || strings.Contains(joined, "opaque-stale-value") {
+		t.Fatalf("unconfigured stored credential survived in subprocess env")
+	}
+}
+
+func pathListContains(paths []string, want string) bool {
+	want = pathComparisonKey(want)
+	for _, path := range paths {
+		if pathComparisonKey(path) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNormalizeAdditionalDirsRejectsInvalidPaths(t *testing.T) {

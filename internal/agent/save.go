@@ -20,7 +20,6 @@ import (
 	"reasonix/internal/fileutil"
 	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/provider"
-	"reasonix/internal/secrets"
 	"reasonix/internal/store"
 )
 
@@ -203,16 +202,6 @@ func (s *Session) save(path string, mode sessionSaveMode) error {
 	// stalest capture written last would then read the newer transcript it
 	// lost the race to as a bogus stale-prefix conflict.
 	msgs, version, rewriteVersion := s.snapshotWithVersion()
-	// Durable transcripts are always redacted, independent of the live
-	// [secrets] redact_tool_output toggle. Digest consistency holds because
-	// Redact is deterministic and idempotent (see secrets.Redact): a loaded
-	// session's messages are already redacted, so re-redacting them here is a
-	// byte-for-byte no-op and the snapshot keeps its prefix relationship to
-	// the on-disk transcript — the same digest/prefix machinery that guards
-	// against bogus stale-prefix conflicts (#6083) sees identical bytes. The
-	// persisted baseline (markPersisted) is likewise recorded over the
-	// redacted form, matching what LoadSession will digest back.
-	msgs = secrets.RedactMessages(msgs)
 	digest, contentBytes, err := digestAndSizeSessionMessages(msgs)
 	if err != nil {
 		return err
@@ -553,11 +542,6 @@ func (s *Session) SaveRecoveryBranch(opts RecoveryBranchOptions) (RecoveryBranch
 		return RecoveryBranchInfo{}, fmt.Errorf("empty original session path")
 	}
 	msgs, version, rewriteVersion := s.snapshotWithVersion()
-	// Same redaction contract as save(): recovery branches are durable
-	// transcripts too, and the coverage checks below compare against on-disk
-	// content that save() already redacted — comparing a raw snapshot against
-	// it would misread pure coverage as divergence and fork a bogus branch.
-	msgs = secrets.RedactMessages(msgs)
 	preview, turns := SessionPreviewFromMessages(msgs)
 	if turns == 0 {
 		return RecoveryBranchInfo{}, ErrSessionRecoveryNotNeeded
@@ -938,12 +922,21 @@ func digestSessionMessages(msgs []provider.Message) ([sha256.Size]byte, error) {
 	return digest, err
 }
 
+func messageForSessionIdentity(m provider.Message) provider.Message {
+	// CreatedAt is local display metadata. Keep it out of transcript identity
+	// so older builds that ignore the optional field can share the same event-
+	// log revision and append without false conflicts.
+	m.CreatedAt = 0
+	return m
+}
+
 // digestAndSizeSessionMessages also reports the encoded transcript size, which
 // the save path uses to bound the event log relative to the live content.
 func digestAndSizeSessionMessages(msgs []provider.Message) ([sha256.Size]byte, int64, error) {
 	h := sha256.New()
 	size := int64(0)
 	for _, m := range msgs {
+		m = messageForSessionIdentity(m)
 		b, err := json.Marshal(m)
 		if err != nil {
 			return [sha256.Size]byte{}, 0, err
@@ -976,11 +969,12 @@ func messagesHavePrefix(full, prefix []provider.Message) bool {
 // messagesPrefixDigestDepth returns the number of leading messages of msgs
 // whose storage digest equals target, or -1 when no prefix matches. The
 // digest accumulates exactly like digestAndSizeSessionMessages, so a match at
-// depth k means msgs[:k] is byte-for-byte the transcript that produced target.
+// depth k means msgs[:k] has the same transcript identity as target.
 func messagesPrefixDigestDepth(msgs []provider.Message, target [sha256.Size]byte) int {
 	h := sha256.New()
 	sum := make([]byte, 0, sha256.Size)
 	for i, m := range msgs {
+		m = messageForSessionIdentity(m)
 		b, err := json.Marshal(m)
 		if err != nil {
 			return -1
@@ -1030,6 +1024,8 @@ func messagesWithoutLeadingSystem(msgs []provider.Message) []provider.Message {
 }
 
 func messagesEqualForStorage(a, b provider.Message) bool {
+	a = messageForSessionIdentity(a)
+	b = messageForSessionIdentity(b)
 	ab, err := json.Marshal(a)
 	if err != nil {
 		return false
