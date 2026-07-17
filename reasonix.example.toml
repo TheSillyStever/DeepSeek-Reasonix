@@ -11,7 +11,7 @@ default_model = "deepseek"   # a provider name (→ its default model) or "provi
 theme = "auto"   # auto|dark|light; controls CLI colors only; REASONIX_THEME can override per run
 # theme_style = "graphite"   # graphite|aurora|slate|carbon|nocturne|amber and legacy aliases
 # shortcut_layout = "desktop"   # classic|desktop; compatibility setting; Shift+Tab toggles Plan, Ctrl+Y toggles YOLO
-# cursor_shape = "underline"   # block|underline|bar; text input cursor shape; default underline to avoid CJK rendering artifacts
+# cursor_shape = "bar"   # block|underline|bar; text input cursor shape; slim default avoids covering CJK characters
 
 [desktop]
 layout_style = "classic"   # classic|workbench|creation; desktop layout style
@@ -29,7 +29,6 @@ ask_request = true   # notify when a question is waiting
 # system_prompt_file = "prompts/system.md"   # overrides system_prompt when set
 temperature       = 0.0
 auto_plan         = "off"   # user-level only; ignored in project reasonix.toml
-memory_compiler = { enabled = true }   # user-level only; Memory v5 execution compiler
 # reasoning_language = "auto"   # visible reasoning text: auto|zh|en
 # auto_plan_classifier = "deepseek-flash"   # optional; only used for borderline tasks
 # plan_mode_allowed_tools = ["mcp__legacy__reader"]   # legacy MCP read-only trust alias; does not change Plan availability
